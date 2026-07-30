@@ -198,6 +198,41 @@ Two smaller export defects were found by reading the published files:
 was indistinguishable from a broken writer), and `scheduled_for` serialised as the
 string `"None"` instead of JSON `null`. Both fixed and tested.
 
+## 5b. The defect that only a second day could reveal (2026-07-29)
+
+**The 13:00 scheduled run did not fire.** Not late -- it did not fire at all, and on
+the machine's sleep habits it would not have fired for about a week.
+
+APScheduler waits on `threading.Event.wait(seconds)`. On macOS that timeout is
+measured by `mach_absolute_time()`, which **stops while the machine is asleep**, and
+Python exposes no `CLOCK_BOOTTIME` on Darwin to measure it any other way. The daemon
+set one 20.24-hour timer at startup for the next 13:00 slot. Measured on this host:
+
+```console
+$ # wall clock vs monotonic since boot
+wall clock since boot: 298.615 h
+monotonic since boot : 167.213 h
+=> TOTAL SLEEP        : 131.40 h
+```
+
+A laptop that is closed most of the time accrues sleep faster than a daily timer
+burns down, so a "daily" schedule degrades into "whenever the lid has been open long
+enough" -- silently, with the process alive, no error, and an empty stderr log. A
+`sample` of the running process showed a single thread parked in `pthread_cond_wait`,
+exactly as designed and exactly wrong.
+
+This was invisible to every earlier test because they were all short-horizon: the
+catch-up ran minutes after daemon start, and the launchd firing test used launchd's
+own calendar, which *is* sleep-aware.
+
+**Fix:** a 60-second wall-clock watchdog (`SchedulerDaemon._watchdog`) that re-runs
+`reconcile()` and decides from `utcnow()`, so drift is bounded by one poll interval
+instead of by the lid. A run starting within `on_time_grace_minutes` (10) of its slot
+is recorded as `scheduled`; later than that it is honestly a `catch_up`. The
+`CronTrigger` is kept for hosts that stay awake, where it fires precisely; the two
+cannot double-run because the slot is unique per genuine run and the execution lock
+is held besides. Twelve tests cover it.
+
 ## 6. Correction made to the database
 
 `production_schedule.first_genuine_scheduled_run_id` had been set to run 4 by the
@@ -284,5 +319,10 @@ truthfully.
     and each row references the snapshot its own detail check pointed at.
 15. **Genuine-history boundary recorded and honest** — yes; `first_genuine_run_id=4`,
     `first_published_run_id=null`, pre-deployment runs listed with true triggers.
-16. **First unattended scheduled run** — **not yet observed.** Due
-    2026-07-29T11:00:00Z. This report does not claim it.
+16. **First unattended scheduled run** — **still not observed, and now understood.**
+    The 2026-07-29T11:00:00Z slot did not fire: a single long APScheduler timer
+    cannot survive a sleeping laptop (§5b). The slot was filled 20 minutes late by
+    run 7, a genuine `catch_up`, after the watchdog fix was deployed. A run with
+    `trigger_type='scheduled'` requires the machine to be awake across the 13:00
+    boundary with the watchdog running, which has not yet happened. This report
+    still does not claim it.

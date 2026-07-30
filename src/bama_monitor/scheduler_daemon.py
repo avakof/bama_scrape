@@ -18,6 +18,15 @@ Past the grace window it records a missed slot and alerts instead.
 triggers, so a manual run attributed to today's slot neither satisfies nor blocks
 the scheduled execution.
 
+**A long timer is not trusted.** ``CronTrigger`` fires precisely on a machine that
+stays awake, and not at all on one that does not: APScheduler waits on
+``threading.Event.wait``, whose timeout on macOS is measured by
+``mach_absolute_time()``, which stops while the machine sleeps. Observed here, not
+theorised -- 131 hours of sleep against 298 of wall clock meant a 20-hour timer had
+barely advanced when its slot arrived, and the job simply did not fire. A
+60-second watchdog re-decides from the wall clock instead, so drift is bounded by
+one interval rather than by the lid.
+
 **Overlap is prevented at four layers.** APScheduler's ``max_instances=1``, the
 filesystem lock, the database lock row, and (on PostgreSQL) a session advisory
 lock. Any one of them can fail; all four failing at once is the scenario this does
@@ -40,6 +49,7 @@ from zoneinfo import ZoneInfo
 from apscheduler.executors.pool import ThreadPoolExecutor
 from apscheduler.schedulers.background import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
 from bama_scraper.logging_config import get_logger
 
@@ -322,6 +332,14 @@ class SchedulerDaemon:
             name=f"Bama daily production run at {self.cfg.run_at} {self.cfg.timezone}",
             replace_existing=True,
         )
+        # The mechanism that actually holds on a machine that sleeps.
+        self.scheduler.add_job(
+            self._watchdog,
+            trigger=IntervalTrigger(seconds=self.cfg.watchdog_interval_seconds),
+            id="bama-slot-watchdog",
+            name="Wall-clock slot watchdog",
+            replace_existing=True,
+        )
 
         log.info(
             "scheduler.started",
@@ -357,6 +375,53 @@ class SchedulerDaemon:
 
     def _scheduled_job(self) -> None:
         self.execute(trigger_type=TriggerType.SCHEDULED, scheduled_for=self.todays_slot())
+
+    def _watchdog(self) -> None:
+        """Re-decide from the wall clock, often, instead of trusting one long timer.
+
+        APScheduler waits on ``threading.Event.wait(seconds)``. On macOS that
+        timeout is measured by ``mach_absolute_time()``, which **stops while the
+        machine is asleep** -- and Python exposes no ``CLOCK_BOOTTIME`` there to
+        measure it any other way.
+
+        The consequence was observed, not theorised. The daemon set one
+        20.24-hour timer for the 13:00 slot. By the time that slot arrived the
+        machine had accumulated 131 hours of sleep against 298 hours of wall
+        clock, so the timer had barely advanced and the job did not fire -- not
+        late, simply not that day. A daily schedule on a laptop degrades into
+        "whenever the lid has been open long enough", silently.
+
+        Polling cannot fix a clock, so this does not try. It keeps every waiting
+        interval short enough that the drift is bounded by one interval, and makes
+        the *decision* on the wall clock via :meth:`reconcile`, which is where the
+        truth lives. The cron job is kept for machines that stay awake, where it
+        fires precisely on the second; the two cannot double-run because the slot
+        is unique per genuine run and the execution lock is held besides.
+        """
+        try:
+            decision = self.reconcile()
+        except Exception as exc:  # noqa: BLE001 - a watchdog must not die
+            log.error("scheduler.watchdog_failed", error=repr(exc))
+            return
+
+        action = decision["action"]
+        if action in ("none", "wait"):
+            return
+
+        log.info("scheduler.watchdog", **{k: str(v) for k, v in decision.items()})
+        if action == "catch_up":
+            late = float(decision.get("minutes_late") or 0.0)
+            # Firing within a few minutes of the slot IS the scheduled run. Calling
+            # it a catch-up would understate the automation; calling a two-hour-late
+            # run `scheduled` would overstate it.
+            trigger = (
+                TriggerType.SCHEDULED
+                if late <= self.cfg.on_time_grace_minutes
+                else TriggerType.CATCH_UP
+            )
+            self.execute(trigger_type=trigger, scheduled_for=parse_ts(decision["slot"]))
+        elif action == "record_missed":
+            self.record_missed_slot(decision)
 
     def _reconcile_on_startup(self) -> None:
         decision = self.reconcile()

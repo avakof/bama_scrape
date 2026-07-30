@@ -202,6 +202,15 @@ class MonitorConfig(BaseModel):
     #: How late a missed slot may still be run as `catch_up`. Beyond this the slot
     #: is recorded as missed rather than fabricated.
     catch_up_grace_minutes: int = 240
+
+    #: How often the wall-clock watchdog re-checks whether the slot is due.
+    #: This exists because a single long timer cannot be trusted on a laptop --
+    #: see `scheduler_daemon.SchedulerDaemon._watchdog`.
+    watchdog_interval_seconds: int = 60
+
+    #: A run that starts within this many minutes of its slot fired on time and is
+    #: recorded as `scheduled`. Later than that and it is honestly a `catch_up`.
+    on_time_grace_minutes: int = 10
     reports_dir: Path = REPO_ROOT / "reports"
     lock_dir: Path = REPO_ROOT / "monitor_data" / "locks"
 

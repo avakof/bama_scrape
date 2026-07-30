@@ -13,6 +13,7 @@ import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -912,3 +913,85 @@ class TestSnapshotFileIntegrity:
         assert _iso(None) is None
         assert _iso(datetime(2026, 7, 28, 11, tzinfo=UTC)) == "2026-07-28T11:00:00+00:00"
         assert json.loads(json.dumps({"scheduled_for": _iso(None)}))["scheduled_for"] is None
+
+
+class TestSlotWatchdog:
+    """The mechanism that survives a machine which sleeps.
+
+    A single long timer does not. APScheduler waits on ``threading.Event.wait``,
+    and on macOS that timeout advances only while the machine is awake, so a daily
+    schedule silently becomes "whenever the lid has been open long enough".
+    """
+
+    def _slot_today(self, daemon: SchedulerDaemon) -> datetime:
+        return daemon.todays_slot()
+
+    def test_nothing_happens_before_the_slot(self, db: Database, cfg: MonitorConfig) -> None:
+        daemon = _daemon(cfg)
+        calls: list[Any] = []
+        daemon.execute = lambda **kw: calls.append(kw)  # type: ignore[method-assign]
+        before = daemon.todays_slot() - timedelta(minutes=30)
+        daemon.reconcile = lambda **_: {"action": "wait", "slot": before.isoformat()}  # type: ignore[method-assign]
+        daemon._watchdog()
+        assert calls == []
+
+    def test_firing_close_to_the_slot_is_a_scheduled_run(
+        self, db: Database, cfg: MonitorConfig
+    ) -> None:
+        """Within a few minutes IS the scheduled run; calling it a catch-up
+        would understate the automation."""
+        daemon = _daemon(cfg)
+        calls: list[Any] = []
+        daemon.execute = lambda **kw: calls.append(kw)  # type: ignore[method-assign]
+        slot = daemon.todays_slot()
+        daemon.reconcile = lambda **_: {  # type: ignore[method-assign]
+            "action": "catch_up",
+            "slot": slot.isoformat(),
+            "minutes_late": 1.5,
+        }
+        daemon._watchdog()
+        assert calls and calls[0]["trigger_type"] == "scheduled"
+
+    def test_firing_long_after_the_slot_is_honestly_a_catch_up(
+        self, db: Database, cfg: MonitorConfig
+    ) -> None:
+        daemon = _daemon(cfg)
+        calls: list[Any] = []
+        daemon.execute = lambda **kw: calls.append(kw)  # type: ignore[method-assign]
+        slot = daemon.todays_slot()
+        daemon.reconcile = lambda **_: {  # type: ignore[method-assign]
+            "action": "catch_up",
+            "slot": slot.isoformat(),
+            "minutes_late": 125.0,
+        }
+        daemon._watchdog()
+        assert calls and calls[0]["trigger_type"] == "catch_up"
+
+    def test_an_already_filled_slot_is_left_alone(self, db: Database, cfg: MonitorConfig) -> None:
+        daemon = _daemon(cfg)
+        calls: list[Any] = []
+        daemon.execute = lambda **kw: calls.append(kw)  # type: ignore[method-assign]
+        daemon.reconcile = lambda **_: {"action": "none", "slot": "x", "existing_run_id": 4}  # type: ignore[method-assign]
+        daemon._watchdog()
+        assert calls == [], "the watchdog runs every minute; it must never re-run a filled slot"
+
+    def test_a_watchdog_failure_does_not_kill_the_watchdog(
+        self, db: Database, cfg: MonitorConfig
+    ) -> None:
+        """A scheduler that dies on one bad poll stops being a scheduler."""
+        daemon = _daemon(cfg)
+
+        def boom(**_: Any) -> dict[str, Any]:
+            raise RuntimeError("database briefly unreachable")
+
+        daemon.reconcile = boom  # type: ignore[method-assign]
+        daemon._watchdog()  # must not raise
+
+    def test_the_watchdog_interval_is_short_enough_to_bound_the_drift(
+        self, cfg: MonitorConfig
+    ) -> None:
+        """Drift is bounded by one interval, so it has to be small."""
+        assert cfg.watchdog_interval_seconds <= 300
+        assert cfg.on_time_grace_minutes * 60 > cfg.watchdog_interval_seconds, (
+            "a run can never be classified on-time if the poll is slower than the grace"
+        )
