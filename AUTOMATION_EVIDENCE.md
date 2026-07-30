@@ -3,8 +3,9 @@
 What was executed, what was observed, and what has **not** been observed yet.
 Every claim is followed by the command that produced it.
 
-Written 2026-07-28. Host `alis-macbook-air2.home`, macOS 25.5.0, Python 3.14.4,
-SQLite 3.53.0.
+Written 2026-07-28; updated 2026-07-29 (§5b, the missed slot) and 2026-07-30 (the
+first unattended scheduled run, claim 16). Host `alis-macbook-air2.home`,
+macOS 25.5.0, Python 3.14.4, SQLite 3.53.0.
 
 ---
 
@@ -233,13 +234,31 @@ is recorded as `scheduled`; later than that it is honestly a `catch_up`. The
 cannot double-run because the slot is unique per genuine run and the execution lock
 is held besides. Twelve tests cover it.
 
+**The next slot fired on time, but not by the watchdog.** Run 8 started at
+`2026-07-30T11:00:00.170887+00:00` — 170 ms after its slot — and that precision is
+the `CronTrigger`'s signature, not the watchdog's: the watchdog polls on a cadence
+offset from the daemon's 13:20:22 start, so its first check after the slot would
+have fallen near `13:00:22`. The machine simply stayed awake across the boundary
+this time, which is the case cron already handled. **The sleeping-laptop path the
+watchdog exists for is therefore still unexercised in production**, and one on-time
+run is not evidence that it works. What run 8 does establish is that adding the
+watchdog did not break the path that already worked, and that no double-run
+occurred with both mechanisms armed.
+
 ## 6. Correction made to the database
 
 `production_schedule.first_genuine_scheduled_run_id` had been set to run 4 by the
 scheduler's pre-fix code, which advanced the marker on a run that *finished* rather
 than one that *published*. Run 4 is genuine history but failed its validity gate, so
-it is not the first day of the mother dataset. The column is now `NULL` and the
-reason is recorded in the row's `notes`. **Run 4 itself was not touched.**
+it is not the first day of the mother dataset. The column was set to `NULL` and the
+reason recorded in the row's `notes`. **Run 4 itself was not touched.**
+
+It has since advanced on its own, correctly: run 7 published a valid snapshot on
+2026-07-29 and the post-run hook moved the marker to 7. That the run was a
+`catch_up` rather than a `scheduled` one is not a defect in the marker — this column
+answers "when did the mother dataset begin", which is the first *published* day
+whatever fired it. When automation began is the separate `first_genuine_run_id`,
+still 4. Run 8 did not move the marker and should not have.
 
 ## 7. Properties verified by execution, not assertion
 
@@ -261,14 +280,13 @@ $ ls daily_snapshots/latest_valid.json    # absent at that point
 
 ## 8. What has NOT been observed
 
-**No unattended `trigger_type='scheduled'` run has happened yet.** The agent is
-installed and running, launchd has been observed starting a job on its own, and the
-daemon's next trigger is `2026-07-29T11:00:00Z`. Until a row with
-`trigger_type='scheduled'` exists, this deployment does not claim one.
+**The watchdog has not been observed doing its job.** The one slot that has fired
+since it was deployed fired from the cron trigger on an awake machine (§5b). Until a
+slot is filled after real system sleep, the fix is tested but not proven.
 
-**No genuine day is in the mother dataset.** `latest_valid.json` points at run 5,
-which is `manual` and marked `in_genuine_history: false`. Run 4 is genuine but failed
-its gate. `first_published_run_id` is `null`, and that is the honest answer.
+**One unattended scheduled run is not a track record.** Run 8 is a single
+observation, and the two slots before it were both missed and caught up. Nothing
+here supports a claim about reliability over weeks.
 
 **The systemd units remain unverified** — there is no Linux host here.
 
@@ -317,12 +335,16 @@ truthfully.
     `os.replace`, `latest_valid.json` written the same way.
 14. **Deterministic reconstruction with no future content** — yes; identical rebuild,
     and each row references the snapshot its own detail check pointed at.
-15. **Genuine-history boundary recorded and honest** — yes; `first_genuine_run_id=4`,
-    `first_published_run_id=null`, pre-deployment runs listed with true triggers.
-16. **First unattended scheduled run** — **still not observed, and now understood.**
-    The 2026-07-29T11:00:00Z slot did not fire: a single long APScheduler timer
-    cannot survive a sleeping laptop (§5b). The slot was filled 20 minutes late by
-    run 7, a genuine `catch_up`, after the watchdog fix was deployed. A run with
-    `trigger_type='scheduled'` requires the machine to be awake across the 13:00
-    boundary with the watchdog running, which has not yet happened. This report
-    still does not claim it.
+15. **Genuine-history boundary recorded and honest** — yes; `first_genuine_run_id=4`
+    (when automation began), `first_published_run_id=7` (when the mother dataset
+    began, §6), `genuine_scheduled_runs=3`, pre-deployment runs listed with true
+    triggers.
+16. **First unattended scheduled run** — **observed, 2026-07-30.** Run 8 fired at
+    `11:00:00.170887+00:00`, 170 ms after its slot, with `trigger_type='scheduled'`
+    and no row in `missed_schedule_slots`. It ran 2 h 10 min, passed every blocking
+    check, and published: 2,836 advertisements discovered, 122 new, 29 removed,
+    2,832 detail checks for a coverage rate of 1.0, and `latest_valid.json` advanced
+    to run 8 with `in_genuine_history: true` — the first time that pointer has named
+    a scheduled run. Two caveats stay attached to this claim: the run was fired by
+    the cron trigger on an awake machine, so it is not evidence the watchdog works
+    (§5b), and one run is not a reliability record (§8).
