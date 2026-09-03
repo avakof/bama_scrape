@@ -1,6 +1,8 @@
 # Bama scraper configuration.
-# Copy to config.yaml and pass with:  python -m bama_scraper run --config config.yaml
-# Every key here can also be overridden by the equivalent CLI flag.
+# Copy to config.yaml and pass with:  python -m bama_scraper --config config.yaml run
+# Common operational keys have CLI flags. Browser identity, timeouts, page size,
+# retry/context settings, and failed-HTML policy are YAML-only; CLI values win when
+# both are present.
 
 # --- target -----------------------------------------------------------------
 url: "https://bama.ir/car?year=1397-2018,&price=1000000000&body=passenger_car&country=iranian"
@@ -13,6 +15,7 @@ mode: auto
 
 # --- browser ----------------------------------------------------------------
 headed: false          # true opens a visible Chromium window (debugging)
+user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 locale: "fa-IR"
 viewport_width: 1440
 viewport_height: 900

@@ -1,0 +1,116 @@
+# Local monitoring configuration.
+#
+# Copy this file to config.monitor.yaml and pass it before the subcommand:
+#   python -m bama_monitor --config config.monitor.yaml validate
+#
+# Keep database credentials out of YAML. BAMA_MONITOR_DATABASE_URL overrides the
+# model's repository-local SQLite default when database_url is omitted here.
+
+search_url: "https://bama.ir/car?year=1397-2018,&price=1000000000&body=passenger_car&country=iranian"
+
+# One local wall-clock observation slot. IANA timezone data is required.
+timezone: "Europe/Paris"
+run_at: "13:00"
+production_schedule_name: "bama-daily-1300-paris"
+catch_up_grace_minutes: 240
+watchdog_interval_seconds: 60
+on_time_grace_minutes: 10
+
+# State and duration policy.
+removal_confirmation_misses: 2
+# Accepted and included in the configuration hash, but current scoring still uses
+# a hard-coded seven-day persistence test rather than reading this field.
+persistent_absence_days: 7
+entry_tolerance_hours: 36.0
+
+# Reject suspect discovery runs before they can advance listing state.
+health:
+  min_count_ratio_vs_median: 0.30
+  median_window_runs: 7
+  min_absolute_count: 50
+  max_failed_page_ratio: 0.20
+  max_empty_title_ratio: 0.20
+  max_missing_ratio: 0.50
+  require_verified_termination: true
+  require_stabilization: true
+
+# Heuristic evidence weights and reporting thresholds. Scores are ranks, not
+# probabilities, until independently labelled outcomes support calibration.
+scoring:
+  absent_two_valid_runs: 0.30
+  detail_explicitly_unavailable: 0.15
+  detail_persistent_404_410: 0.15
+  recent_price_reduction: 0.10
+  disappeared_soon_after_publication: 0.10
+  seller_did_not_repost: 0.10
+  disappearance_persists_seven_days: 0.10
+  reappeared: -0.30
+  vehicle_reposted: -0.25
+  detail_remains_accessible: -0.20
+  appears_outside_original_filter: -0.20
+  possibly_sold_at: 0.40
+  likely_sold_at: 0.65
+  highly_likely_sold_at: 0.85
+  ranking_min_confidence: 0.65
+  status_promotion_at: 0.65
+  soon_after_publication_days: 3.0
+
+# Repost identity is inferred from several weak signals. image_hash is based on
+# normalized CDN URL paths; it is not a perceptual image-content hash.
+repost:
+  enabled: true
+  lookback_days: 45
+  mileage_tolerance_km: 5000
+  mileage_bucket_km: 10000
+  price_tolerance_ratio: 0.12
+  price_bucket_toman: 50000000  # accepted but not used by the current fingerprint
+  description_similarity_min: 0.72
+  match_threshold: 0.70
+  weight_brand_model_year: 0.30
+  weight_same_seller: 0.20
+  weight_mileage_close: 0.15
+  weight_price_close: 0.10
+  weight_city: 0.05
+  weight_image_hash: 0.20
+  weight_description_similar: 0.15
+  weight_colors: 0.05
+
+# Full detail census is the default. The current census loop is serial even though
+# concurrency configures the shared fetcher. Selective-policy keys apply when
+# check_every_advertisement_daily is false.
+detail:
+  concurrency: 2
+  scrape_new: true
+  scrape_card_changed: true
+  scrape_missing: true
+  scrape_previous_failures: true
+  active_refresh_days_min: 3  # accepted but current refresh selection uses max only
+  active_refresh_days_max: 7
+  qc_sample_ratio: 0.01
+  max_details_per_run: 600
+  check_every_advertisement_daily: true
+  delay_min: 0.4
+  delay_max: 1.2
+  request_timeout: 45.0
+
+# Alert destinations are names of environment variables, never secret values.
+alerts:
+  enabled: true
+  webhook_url_env: "BAMA_MONITOR_WEBHOOK_URL"
+  email_to_env: "BAMA_MONITOR_ALERT_EMAIL"
+  smtp_url_env: "BAMA_MONITOR_SMTP_URL"
+  min_severity: "warning"
+
+# Safe repository-local paths for development. Deployment paths must match the
+# service's writable directories and persistence mounts.
+output_dir: "monitor_data"
+daily_snapshot_dir: "daily_snapshots"
+reports_dir: "reports"
+lock_dir: "monitor_data/locks"
+max_discovery_pages: 5000
+max_run_seconds: 10800.0  # discovery time ceiling, not an overall pipeline deadline
+
+# Accepted by MonitorConfig and the normal CLI, but currently not consumed by the
+# pipeline. It does not make a network command dry-run; use offline tests/fixtures.
+dry_run: false
+log_level: "INFO"
