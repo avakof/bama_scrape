@@ -126,6 +126,7 @@ or grouped asking-price comparison.
 - [Project status and known limitations](docs/reference/project-status-and-limitations.md)
 - [Responsible use and privacy](docs/explanation/responsible-use.md)
 - [Contributing](docs/contributing.md)
+- [Run the Orca agent team](docs/how-to/run-agent-team.md)
 
 The former long-form component pages remain as stable entry points:
 [monitoring](README_MONITOR.md), [EDA](README_EDA.md), and

@@ -24,6 +24,7 @@ that matches the job you are trying to do.
 - [Operate the daily monitor](how-to/monitor.md)
 - [Deploy, back up, and recover](how-to/deploy-and-recover.md)
 - [Run EDA](how-to/analyze.md)
+- [Run the Orca agent team](how-to/run-agent-team.md)
 
 ## Explanation
 
