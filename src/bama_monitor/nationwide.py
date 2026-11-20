@@ -25,6 +25,7 @@ from .config import (
 )
 from .daily_snapshot import export_daily_snapshot
 from .db import connect, parse_ts, utcnow
+from .locking import LockUnavailable, run_lock
 from .repository import Repository
 from .runner import DailyRunner
 from .scheduler_daemon import ProfileMismatchError, SchedulerDaemon
@@ -51,7 +52,10 @@ def _config(state: Path) -> MonitorConfig:
 
 
 def _manual(cfg: MonitorConfig) -> int:
-    with closing(connect(cfg.database_url)) as db:
+    with (
+        closing(connect(cfg.database_url)) as db,
+        run_lock(db, cfg.lock_dir, name="bama_nationwide_manual_publish"),
+    ):
         SchedulerDaemon(cfg).validate_profile_state(db)
         if db.fetchone("SELECT 1 FROM production_schedule LIMIT 1") or db.fetchone(
             "SELECT 1 FROM monitoring_runs WHERE trigger_type<>'manual' OR is_synthetic<>0 LIMIT 1"
@@ -142,7 +146,11 @@ def main(argv: list[str] | None = None) -> int:
     configure_logging(cfg.log_level)
     print(f"{mode.capitalize()} collection uses {cfg.sqlite_path.parent}", flush=True)
     if not args.daily:
-        return _manual(cfg)
+        try:
+            return _manual(cfg)
+        except LockUnavailable as exc:
+            print(f"Another manual collection is using this data directory: {exc}", file=sys.stderr)
+            return 1
 
     print(f"Collecting daily at {cfg.run_at} {cfg.timezone}. Press Ctrl+C to stop.", flush=True)
     stop = Event()

@@ -13,7 +13,7 @@ from bama_monitor.models import DetailResult, DetailVerdict
 from bama_monitor.scrapers import StaticDetailScraper, StaticDiscoveryScraper
 
 
-def test_manual_command_publishes_in_its_own_store(tmp_path, monkeypatch):
+def test_manual_publication_is_isolated_and_blocks_overlapping_collection(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     legacy_db = tmp_path / "legacy.sqlite"
     monkeypatch.setenv("BAMA_MONITOR_DATABASE_URL", f"sqlite:///{legacy_db}")
@@ -49,6 +49,21 @@ def test_manual_command_publishes_in_its_own_store(tmp_path, monkeypatch):
         "_default_detail_factory",
         lambda *_, **kw: StaticDetailScraper(details),
     )
+    export_snapshot = nationwide.export_daily_snapshot
+
+    def overlapping_export(db, cfg, run_id, **kwargs):
+        # Run a second invocation after the collection lock has been released
+        # but before this invocation writes the latest-valid pointer.
+        with monkeypatch.context() as second:
+            second.setattr(
+                nationwide.DailyRunner,
+                "run_daily",
+                lambda *a, **kw: pytest.fail("Second collection started during publication"),
+            )
+            assert nationwide.main([]) == 1
+        return export_snapshot(db, cfg, run_id, **kwargs)
+
+    monkeypatch.setattr(nationwide, "export_daily_snapshot", overlapping_export)
     assert nationwide.main([]) == 0
     root = tmp_path / "bama-nationwide-data"
     snapshot = json.loads((root / "manual/snapshots/latest_valid.json").read_text())
@@ -56,6 +71,8 @@ def test_manual_command_publishes_in_its_own_store(tmp_path, monkeypatch):
     assert snapshot["trigger_type"] == "manual"
     assert not snapshot["in_genuine_history"]
     assert not (root / "daily").exists() and not legacy_db.exists()
+    with sqlite3.connect(root / "manual/monitor.sqlite") as db:
+        assert db.execute("SELECT id FROM monitoring_runs").fetchall() == [(snapshot["run_id"],)]
 
 
 def test_daily_restart_records_downtime_without_inventing_observations(tmp_path, monkeypatch):

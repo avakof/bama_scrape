@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import plistlib
+import shutil
 import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -746,11 +747,12 @@ class TestDailyDataset:
 class TestLaunchdArtefacts:
     def test_the_plist_template_is_valid(self) -> None:
         template = REPO / "deploy" / "macos" / "com.bama.monitor.scheduler.plist"
-        assert template.exists()
-        result = subprocess.run(
-            ["plutil", "-lint", str(template)], capture_output=True, text=True, check=False
-        )
-        assert result.returncode == 0, result.stdout + result.stderr
+        assert isinstance(plistlib.loads(template.read_bytes()), dict)
+        if plutil := shutil.which("plutil"):
+            result = subprocess.run(
+                [plutil, "-lint", "--", str(template)], capture_output=True, text=True, check=False
+            )
+            assert result.returncode == 0, result.stdout + result.stderr
 
     def test_every_deployment_script_exists_and_parses(self) -> None:
         macos = REPO / "deploy" / "macos"
