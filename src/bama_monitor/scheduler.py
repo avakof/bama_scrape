@@ -18,7 +18,7 @@ deployment; :func:`run_forever` exists only for a continuously running process.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from .config import MonitorConfig
@@ -28,6 +28,20 @@ def parse_run_time(value: str) -> time:
     """Parse ``"HH:MM"`` into a :class:`datetime.time`."""
     hour, _, minute = value.partition(":")
     return time(hour=int(hour), minute=int(minute or 0))
+
+
+def slot_for_paris_date(cfg: MonitorConfig, day: date) -> datetime:
+    """The scheduled instant for a **Paris calendar date**, as aware UTC.
+
+    The one-shot contract hands over the date the external event intended to
+    observe, not a UTC instant. Rebuilding the slot from the date keeps the
+    wall-clock rule explicit: 13:00 Paris is 11:00Z in summer and 12:00Z in
+    winter, and ``fold=0`` picks the first occurrence on the autumn transition.
+    """
+    zone = ZoneInfo(cfg.timezone)
+    target = parse_run_time(cfg.run_at)
+    naive = datetime.combine(day, target)
+    return naive.replace(tzinfo=zone, fold=0).astimezone(UTC)
 
 
 def local_slot(day: datetime, cfg: MonitorConfig) -> datetime:

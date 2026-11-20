@@ -28,6 +28,21 @@ DEFAULT_SEARCH_URL = (
     "https://bama.ir/car?year=1397-2018,&price=1000000000&body=passenger_car&country=iranian"
 )
 
+#: Study profiles are opt-in. ``legacy`` keeps the original Iranian-origin
+#: search and, crucially, does not enter into the configuration hash, so
+#: existing runs remain comparable with their own history.
+StudyProfile = Literal["legacy", "nationwide_passenger_v1"]
+LEGACY_STUDY_PROFILE: StudyProfile = "legacy"
+NATIONWIDE_STUDY_PROFILE: StudyProfile = "nationwide_passenger_v1"
+
+LEGACY_PRODUCTION_SCHEDULE_NAME = "bama-daily-1300-paris"
+NATIONWIDE_PRODUCTION_SCHEDULE_NAME = "bama-nationwide-passenger-v1-1300-paris"
+
+#: The database the legacy deployment uses when no environment variable is set.
+#: A profile series must never silently inherit that file: the histories are
+#: different searches and mixing them would make both incomparable.
+LEGACY_DEFAULT_DATABASE_PATH = REPO_ROOT / "monitor_data" / "bama_monitor.sqlite"
+
 
 class AlertConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -164,6 +179,11 @@ class MonitorConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    #: Which search study this deployment belongs to. The value names the
+    #: eligibility semantics that the rest of the pipeline applies; it is not a
+    #: cosmetic label. Only non-legacy profiles join the configuration hash.
+    study_profile: StudyProfile = LEGACY_STUDY_PROFILE
+
     search_url: str = DEFAULT_SEARCH_URL
     timezone: str = "Europe/Paris"
     run_at: str = "13:00"
@@ -198,7 +218,7 @@ class MonitorConfig(BaseModel):
 
     #: Names the production schedule. Slot uniqueness is scoped to it, so a second
     #: schedule (another search, another hour) cannot collide with this one.
-    production_schedule_name: str = "bama-daily-1300-paris"
+    production_schedule_name: str = LEGACY_PRODUCTION_SCHEDULE_NAME
     #: How late a missed slot may still be run as `catch_up`. Beyond this the slot
     #: is recorded as missed rather than fabricated.
     catch_up_grace_minutes: int = 240
@@ -243,7 +263,7 @@ class MonitorConfig(BaseModel):
         which is exactly what this hash is used to detect. Paths and log levels
         are excluded because they change nothing about the data.
         """
-        payload = {
+        payload: dict[str, Any] = {
             "search_url": self.search_url,
             "timezone": self.timezone,
             "removal_confirmation_misses": self.removal_confirmation_misses,
@@ -253,6 +273,11 @@ class MonitorConfig(BaseModel):
             "repost": self.repost.model_dump(),
             "monitor_version": MONITOR_VERSION,
         }
+        # Legacy is the default and predates profiles. Adding a key to its hash
+        # payload would invalidate every existing run's configuration_hash and
+        # make today's inventory incomparable with its own history.
+        if self.study_profile != LEGACY_STUDY_PROFILE:
+            payload["study_profile"] = self.study_profile
         blob = json.dumps(payload, sort_keys=True, ensure_ascii=False)
         return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
@@ -265,7 +290,74 @@ def load_config(path: str | Path | None = None, **overrides: Any) -> MonitorConf
         if candidate.exists():
             data = yaml.safe_load(candidate.read_text(encoding="utf-8")) or {}
     data.update({k: v for k, v in overrides.items() if v is not None})
-    for key in ("output_dir", "reports_dir", "lock_dir"):
+    for key in ("output_dir", "reports_dir", "lock_dir", "daily_snapshot_dir"):
         if data.get(key) is not None:
             data[key] = Path(data[key])
     return MonitorConfig(**data)
+
+
+class ConfigFileError(ValueError):
+    """A required configuration file is missing, unreadable, or malformed."""
+
+
+def load_config_strict(path: str | Path, **overrides: Any) -> MonitorConfig:
+    """Load a config that must exist and parse.
+
+    :func:`load_config` deliberately tolerates a missing path so long-running
+    tools can start from defaults. A production one-shot cannot: silently
+    falling back to the legacy defaults would run a different study against a
+    different database while looking like it succeeded.
+    """
+    candidate = Path(path)
+    if not candidate.is_file():
+        raise ConfigFileError(f"configuration file does not exist: {candidate}")
+    try:
+        raw = candidate.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ConfigFileError(f"configuration file is unreadable: {candidate}: {exc}") from exc
+    try:
+        data = yaml.safe_load(raw)
+    except yaml.YAMLError as exc:
+        raise ConfigFileError(f"configuration file is not valid YAML: {candidate}: {exc}") from exc
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        raise ConfigFileError(f"configuration file must be a YAML mapping: {candidate}")
+    try:
+        return load_config(candidate, **overrides)
+    except Exception as exc:  # pydantic validation errors carry the useful detail
+        raise ConfigFileError(f"configuration file is invalid: {candidate}: {exc}") from exc
+
+
+def validate_study_profile_paths(cfg: MonitorConfig) -> None:
+    """Reject a profile series accidentally wired to legacy state.
+
+    The portable one-shot is launched from a restored state directory. If the
+    environment is missing, ``database_url`` would fall back to the repository's
+    legacy SQLite file; the run would then add a different search's rows to an
+    existing history. Likewise the legacy schedule name would share slot
+    uniqueness with the original series.
+    """
+    if cfg.study_profile == LEGACY_STUDY_PROFILE:
+        if cfg.production_schedule_name == NATIONWIDE_PRODUCTION_SCHEDULE_NAME:
+            raise ConfigFileError(
+                f"the nationwide schedule name requires study_profile={NATIONWIDE_STUDY_PROFILE!r}"
+            )
+        return
+
+    if cfg.production_schedule_name == LEGACY_PRODUCTION_SCHEDULE_NAME:
+        raise ConfigFileError(
+            f"study_profile={cfg.study_profile!r} must not reuse the legacy production "
+            f"schedule name {LEGACY_PRODUCTION_SCHEDULE_NAME!r}"
+        )
+    try:
+        actual = cfg.sqlite_path.resolve()
+    except (ValueError, OSError):
+        actual = None
+    if actual is not None and actual == LEGACY_DEFAULT_DATABASE_PATH.resolve():
+        raise ConfigFileError(
+            "study_profile="
+            f"{cfg.study_profile!r} resolved the legacy default database "
+            f"{LEGACY_DEFAULT_DATABASE_PATH}; set BAMA_MONITOR_DATABASE_URL to the "
+            "restored state database"
+        )

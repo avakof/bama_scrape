@@ -1,0 +1,34 @@
+# Opt-in nationwide passenger-car study, portable across runners.
+#
+# This file is deliberately path-relative. The one-shot workflow restores a
+# state directory, changes into it, and sets:
+#
+#   BAMA_MONITOR_DATABASE_URL=sqlite:////absolute/state/monitor.sqlite
+#
+# so evidence/, reports/, snapshots/ and locks/ are created beside the database
+# rather than inside the repository checkout.
+#
+# The site query is a lower bound (`priceFrom=1000000000`). The nationwide
+# profile's eligibility rule is stricter: only a numeric, verified full asking
+# price strictly greater than 1,000,000,000 Toman qualifies. The URL cannot
+# express ">" so that decision belongs to the local eligibility step, keyed on
+# study_profile below. No `country=` parameter is sent: all origins are in scope.
+study_profile: "nationwide_passenger_v1"
+
+search_url: "https://bama.ir/car?year=1397-2018,&price=1000000000&body=passenger_car"
+
+timezone: "Europe/Paris"
+run_at: "13:00"
+
+# Kept separate from `bama-daily-1300-paris` so slot uniqueness, the production
+# schedule marker and latest_valid.json cannot mix this series with the legacy
+# Iranian-origin series.
+production_schedule_name: "bama-nationwide-passenger-v1-1300-paris"
+
+# Relative to the restored state directory (the process working directory).
+output_dir: "evidence"
+reports_dir: "reports"
+daily_snapshot_dir: "snapshots"
+lock_dir: "locks"
+
+log_level: "INFO"

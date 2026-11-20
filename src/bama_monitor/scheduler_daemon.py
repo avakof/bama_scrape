@@ -42,7 +42,8 @@ import signal
 import socket
 import sys
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -54,13 +55,29 @@ from apscheduler.triggers.interval import IntervalTrigger
 from bama_scraper.logging_config import get_logger
 
 from .alerts import AlertManager
-from .config import MonitorConfig, load_config
-from .db import connect, parse_ts, utcnow
-from .models import AlertSeverity, TriggerType
+from .config import (
+    MonitorConfig,
+    load_config,
+    load_config_strict,
+    validate_study_profile_paths,
+)
+from .db import Database, connect, parse_ts, utcnow
+from .locking import LockUnavailable, run_lock
+from .models import AlertSeverity, RunHealth, TriggerType
 from .repository import Repository
-from .scheduler import next_scheduled_slot, parse_run_time
+from .scheduler import next_scheduled_slot, parse_run_time, slot_for_paris_date
 
 log = get_logger("bama_monitor.scheduler_daemon")
+
+#: A one-shot invocation must be serialised against another one for the same
+#: state directory. DailyRunner has its own lock for the pipeline; this outer
+#: lock covers the reconcile-and-decide step so two workflows cannot both see an
+#: empty slot and attempt to fill it.
+RUN_DUE_LOCK_NAME = "bama_monitor_run_due"
+
+
+class ProfileMismatchError(RuntimeError):
+    """The database's recorded series does not match this configuration."""
 
 
 class SchedulerDaemon:
@@ -88,6 +105,49 @@ class SchedulerDaemon:
         local_date = day.astimezone(self.zone).date()
         naive = datetime.combine(local_date, target)
         return naive.replace(tzinfo=self.zone, fold=0).astimezone(UTC)
+
+    def slot_for_paris_date(self, day: date) -> datetime:
+        """The same slot, addressed by its Paris calendar date."""
+        return slot_for_paris_date(self.cfg, day)
+
+    # -- profile integrity -------------------------------------------------
+
+    def validate_profile_state(self, db: Database) -> None:
+        """Refuse to append a profile series to a different series' history.
+
+        The configuration hash already changes with a non-legacy profile, so a
+        collision would create a second, parallel run column rather than
+        corrupting rows. That is still wrong: the slot unique index, the
+        production schedule marker and the published pointer would describe two
+        incompatible studies under one schedule name. This check makes the
+        mismatch a visible failure before any observation is made.
+        """
+        if self.cfg.study_profile == "legacy":
+            return
+        repo = Repository(db)
+        schedule = repo.get_production_schedule(self.cfg.production_schedule_name)
+        if schedule is not None:
+            recorded = schedule.get("search_configuration_hash")
+            current = self.cfg.configuration_hash()
+            if recorded != current:
+                raise ProfileMismatchError(
+                    f"production schedule {self.cfg.production_schedule_name!r} is "
+                    f"recorded with configuration_hash {recorded!r}, but this config "
+                    f"computes {current!r} (study_profile={self.cfg.study_profile!r}); "
+                    "refusing to mix series histories"
+                )
+        mismatched = db.fetchone(
+            "SELECT id, configuration_hash FROM monitoring_runs"
+            " WHERE production_schedule_name=? AND configuration_hash<>?"
+            " ORDER BY id LIMIT 1",
+            [self.cfg.production_schedule_name, self.cfg.configuration_hash()],
+        )
+        if mismatched is not None:
+            raise ProfileMismatchError(
+                f"run {mismatched['id']} under {self.cfg.production_schedule_name!r} "
+                f"used configuration_hash {mismatched['configuration_hash']!r}, not "
+                f"{self.cfg.configuration_hash()!r}; refusing to mix series histories"
+            )
 
     def todays_slot(self, *, now: datetime | None = None) -> datetime:
         return self.slot_for_date(now or utcnow())
@@ -196,9 +256,18 @@ class SchedulerDaemon:
     # -- execution ---------------------------------------------------------
 
     def execute(
-        self, *, trigger_type: TriggerType, scheduled_for: datetime | None = None
+        self,
+        *,
+        trigger_type: TriggerType,
+        scheduled_for: datetime | None = None,
+        discovery_scraper: Any = None,
+        detail_scraper_factory: Any = None,
     ) -> dict[str, Any]:
-        """Run one production job. Called by the trigger and by reconciliation."""
+        """Run one production job. Called by the trigger and by reconciliation.
+
+        The scraper arguments exist for deterministic offline tests; production
+        calls leave them unset and the runner constructs its normal adapters.
+        """
         from .runner import DailyRunner
 
         slot = scheduled_for or self.todays_slot()
@@ -209,7 +278,12 @@ class SchedulerDaemon:
             instance=self.instance_id,
         )
         db = connect(self.cfg.database_url)
-        runner = DailyRunner(self.cfg, db=db)
+        runner = DailyRunner(
+            self.cfg,
+            db=db,
+            discovery_scraper=discovery_scraper,
+            detail_scraper_factory=detail_scraper_factory,
+        )
         try:
             outcome = asyncio.run(
                 runner.run_daily(
@@ -221,7 +295,10 @@ class SchedulerDaemon:
                 )
             )
             payload = outcome.as_dict()
-            self._after_run(db, outcome)
+            payload["snapshot"] = self._after_run(db, outcome)
+            payload["trigger_type"] = str(trigger_type)
+            payload["scheduled_for"] = slot.isoformat()
+            payload["run_times"] = self._run_times(db, outcome.run_id)
             log.info(
                 "scheduler.job_finished",
                 run_id=outcome.run_id,
@@ -239,20 +316,53 @@ class SchedulerDaemon:
                 )
             except Exception:  # noqa: BLE001
                 pass
-            return {"error": repr(exc), "trigger_type": str(trigger_type)}
+            return {
+                "error": repr(exc),
+                "trigger_type": str(trigger_type),
+                "scheduled_for": slot.isoformat(),
+                "snapshot": {
+                    "attempted": False,
+                    "exported": False,
+                    "latest_valid_updated": False,
+                    "error": repr(exc),
+                },
+            }
         finally:
             db.close()
 
-    def _after_run(self, db: Any, outcome: Any) -> None:
-        """Export the daily snapshot and advance the history marker."""
-        from .daily_snapshot import export_daily_snapshot
+    def _after_run(self, db: Any, outcome: Any) -> dict[str, Any]:
+        """Export the daily snapshot and advance the history marker.
 
+        Returns a machine-readable record of what publication actually did. A
+        run that finished is not the same as a day that was published, and the
+        one-shot exit code needs the difference.
+        """
+        from .daily_snapshot import export_daily_snapshot, read_latest_pointer
+
+        summary: dict[str, Any] = {
+            "attempted": False,
+            "exported": False,
+            "latest_valid_updated": False,
+            "destination": None,
+            "validation": None,
+            "pointer_run_id": None,
+            "error": None,
+        }
         if outcome.run_id is None:
-            return
+            return summary
+        summary["attempted"] = True
         published = False
         try:
             result = export_daily_snapshot(db, self.cfg, outcome.run_id, require_valid=True)
             published = bool(result.get("exported"))
+            summary.update(
+                {
+                    "exported": published,
+                    "latest_valid_updated": bool(result.get("latest_valid_updated")),
+                    "destination": result.get("destination"),
+                    "validation": result.get("validation"),
+                }
+            )
             log.info(
                 "scheduler.snapshot",
                 run_id=outcome.run_id,
@@ -260,7 +370,14 @@ class SchedulerDaemon:
                 latest_valid_updated=result.get("latest_valid_updated"),
             )
         except Exception as exc:  # noqa: BLE001 - a failed export must not lose the run
+            summary["error"] = repr(exc)
             log.error("scheduler.snapshot_failed", run_id=outcome.run_id, error=repr(exc))
+
+        try:
+            pointer = read_latest_pointer(self.cfg)
+            summary["pointer_run_id"] = pointer.get("run_id") if pointer else None
+        except Exception:  # noqa: BLE001 - a damaged pointer is reported by omission
+            summary["pointer_run_id"] = None
 
         repo = Repository(db)
         schedule = repo.get_production_schedule(self.cfg.production_schedule_name)
@@ -281,6 +398,282 @@ class SchedulerDaemon:
                     "notes": "first genuine scheduled execution",
                 }
             )
+        return summary
+
+    @staticmethod
+    def _run_times(db: Any, run_id: int | None) -> dict[str, Any]:
+        """Actual execution times from the run row, never the intended slot."""
+        if run_id is None:
+            return {}
+        row = Repository(db).get_run(run_id) or {}
+        times: dict[str, Any] = {}
+        for key in (
+            "scheduled_for",
+            "scheduled_date_paris",
+            "scheduled_hour_paris",
+            "started_at",
+            "finished_at",
+            "discovery_started_at",
+            "discovery_finished_at",
+            "detail_started_at",
+            "detail_finished_at",
+            "snapshot_export_path",
+        ):
+            value = row.get(key)
+            parsed = parse_ts(value)
+            times[key] = parsed.isoformat() if parsed is not None else value
+        return times
+
+    # -- portable one-shot -------------------------------------------------
+
+    def run_due(
+        self,
+        *,
+        slot_date: date,
+        now: datetime | None = None,
+        db: Database | None = None,
+        discovery_scraper: Any = None,
+        detail_scraper_factory: Any = None,
+    ) -> dict[str, Any]:
+        """Run (or explicitly decline) one slot named by its Paris date.
+
+        This is the GitHub Actions entry point, not a daemon: it decides once,
+        acts once and exits. The intended slot is always rebuilt from the
+        external event's Paris date, so the stored ``scheduled_for`` is the
+        original 13:00 Paris instant, while ``started_at``/``finished_at``
+        remain the actual execution times.
+        """
+        checked_at = (now or utcnow()).astimezone(UTC)
+        slot = self.slot_for_paris_date(slot_date)
+        base: dict[str, Any] = {
+            "event": "run_due",
+            "study_profile": self.cfg.study_profile,
+            "production_schedule_name": self.cfg.production_schedule_name,
+            "slot_date_paris": slot_date.isoformat(),
+            "slot_utc": slot.isoformat(),
+            "checked_at_utc": checked_at.isoformat(),
+            "timezone": self.cfg.timezone,
+            "run_at_local": self.cfg.run_at,
+        }
+        self.cfg.ensure_dirs()
+        own_db = db is None
+        connection = db or connect(self.cfg.database_url)
+        try:
+            try:
+                self.validate_profile_state(connection)
+            except ProfileMismatchError as exc:
+                return {
+                    **base,
+                    "status": "profile_error",
+                    "action": "refuse",
+                    "exit_code": 1,
+                    "reason": str(exc),
+                }
+            try:
+                with run_lock(connection, self.cfg.lock_dir, name=RUN_DUE_LOCK_NAME):
+                    return self._run_due_locked(
+                        connection,
+                        base=base,
+                        slot=slot,
+                        checked_at=checked_at,
+                        discovery_scraper=discovery_scraper,
+                        detail_scraper_factory=detail_scraper_factory,
+                    )
+            except LockUnavailable as exc:
+                return {
+                    **base,
+                    "status": "locked",
+                    "action": "refuse",
+                    "exit_code": 1,
+                    "reason": str(exc),
+                }
+        finally:
+            if own_db:
+                connection.close()
+
+    def _run_due_locked(
+        self,
+        db: Database,
+        *,
+        base: dict[str, Any],
+        slot: datetime,
+        checked_at: datetime,
+        discovery_scraper: Any,
+        detail_scraper_factory: Any,
+    ) -> dict[str, Any]:
+        repo = Repository(db)
+        existing = repo.genuine_production_run_for_slot(
+            scheduled_for=slot,
+            configuration_hash=self.cfg.configuration_hash(),
+            production_schedule_name=self.cfg.production_schedule_name,
+        )
+        if existing is not None:
+            return self._existing_run_result(db, existing, base=base)
+
+        if checked_at < slot:
+            return {
+                **base,
+                "status": "not_due",
+                "action": "wait",
+                "exit_code": 0,
+                "minutes_until_slot": round((slot - checked_at).total_seconds() / 60.0, 1),
+                "reason": "the intended Paris slot has not arrived; nothing was observed",
+            }
+
+        late_minutes = (checked_at - slot).total_seconds() / 60.0
+        if late_minutes > self.cfg.catch_up_grace_minutes:
+            decision = {
+                "slot": slot.isoformat(),
+                "minutes_late": round(late_minutes, 1),
+                "reason": (
+                    f"slot passed {late_minutes:.0f} min ago, beyond the "
+                    f"{self.cfg.catch_up_grace_minutes} min grace window; the "
+                    "observation cannot be recovered and will not be fabricated"
+                ),
+            }
+            self.record_missed_slot(decision)
+            return {
+                **base,
+                "status": "missed",
+                "action": "record_missed",
+                "exit_code": 1,
+                "minutes_late": round(late_minutes, 1),
+                "reason": decision["reason"],
+            }
+
+        trigger = (
+            TriggerType.SCHEDULED
+            if late_minutes <= self.cfg.on_time_grace_minutes
+            else TriggerType.CATCH_UP
+        )
+        payload = self.execute(
+            trigger_type=trigger,
+            scheduled_for=slot,
+            discovery_scraper=discovery_scraper,
+            detail_scraper_factory=detail_scraper_factory,
+        )
+        return self._executed_result(db, payload, base=base, trigger=trigger)
+
+    def _existing_run_result(
+        self, db: Database, run: dict[str, Any], *, base: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Report a slot that already has a genuine run, without duplicating it."""
+        from .daily_snapshot import read_latest_pointer
+
+        run_id = int(run["id"])
+        run_status = str(run.get("status") or "")
+        pointer = read_latest_pointer(self.cfg)
+        destination = run.get("snapshot_export_path")
+        manifest = Path(destination) / "manifest.json" if destination else None
+        published = bool(manifest is not None and manifest.is_file())
+        result: dict[str, Any] = {
+            **base,
+            "action": "none",
+            "run_id": run_id,
+            "run_status": run_status,
+            "run_times": self._run_times(db, run_id),
+            "snapshot": {
+                "exported": published,
+                "destination": destination,
+                "pointer_run_id": pointer.get("run_id") if pointer else None,
+            },
+        }
+        if run_status == str(RunHealth.VALID) and published:
+            return {
+                **result,
+                "status": "already_settled",
+                "exit_code": 0,
+                "reason": "this slot already has a valid, published genuine run",
+            }
+        if run_status == str(RunHealth.VALID):
+            return {
+                **result,
+                "status": "previous_run_unpublished",
+                "exit_code": 1,
+                "reason": (
+                    "a valid genuine run exists for this slot but its snapshot is "
+                    "missing; refusing to report success for an unpublished day"
+                ),
+            }
+        if run_status == str(RunHealth.RUNNING):
+            return {
+                **result,
+                "status": "previous_run_pending",
+                "exit_code": 1,
+                "reason": (
+                    "a run for this slot is still marked running; refusing to start "
+                    "a second observation of the same slot"
+                ),
+            }
+        return {
+            **result,
+            "status": "previous_run_failed",
+            "exit_code": 1,
+            "reason": (
+                f"the genuine run for this slot ended with status {run_status!r}; "
+                "a previous failure must not be reported as success"
+            ),
+        }
+
+    def _executed_result(
+        self,
+        db: Database,
+        payload: dict[str, Any],
+        *,
+        base: dict[str, Any],
+        trigger: TriggerType,
+    ) -> dict[str, Any]:
+        run_id = payload.get("run_id")
+        snapshot = payload.get("snapshot") or {}
+        run_status = str(payload.get("status") or "")
+        result: dict[str, Any] = {
+            **base,
+            "action": str(trigger),
+            "trigger_type": str(trigger),
+            "run_id": run_id,
+            "run_status": run_status,
+            "run_times": payload.get("run_times") or self._run_times(db, run_id),
+            "snapshot": snapshot,
+            "discovered_count": payload.get("discovered_count"),
+        }
+        if payload.get("error") or run_id is None:
+            return {
+                **result,
+                "status": "failed",
+                "exit_code": 1,
+                "reason": str(payload.get("error") or "the runner produced no run row"),
+            }
+        if run_status != str(RunHealth.VALID):
+            return {
+                **result,
+                "status": "invalid",
+                "exit_code": 1,
+                "reason": f"the run ended with status {run_status!r}; nothing was published",
+            }
+        destination = snapshot.get("destination")
+        published = bool(
+            snapshot.get("exported")
+            and (snapshot.get("validation") or {}).get("valid")
+            and destination
+            and (Path(destination) / "manifest.json").is_file()
+            and snapshot.get("latest_valid_updated")
+        )
+        if not published:
+            return {
+                **result,
+                "status": "unpublished",
+                "exit_code": 1,
+                "reason": (
+                    "the run is valid but its snapshot/latest-valid pointer was not "
+                    "published; refusing to report success"
+                ),
+            }
+        return {
+            **result,
+            "status": "completed",
+            "exit_code": 0,
+            "reason": "the intended slot was observed and published",
+        }
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -473,6 +866,116 @@ def _redact(url: str) -> str:
     return url
 
 
+def _emit_status(payload: dict[str, Any]) -> None:
+    """One machine-readable line on stdout; logs may precede it."""
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True), flush=True)
+
+
+def _run_due_cli(args: Any) -> int:
+    """The portable one-shot entry point used by the external workflow."""
+    checked_at = utcnow()
+    if args.once or args.print_next:
+        _emit_status(
+            {
+                "event": "run_due",
+                "status": "config_error",
+                "exit_code": 1,
+                "checked_at_utc": checked_at.isoformat(),
+                "reason": "--run-due cannot be combined with --once or --print-next",
+            }
+        )
+        return 1
+    if not args.config:
+        _emit_status(
+            {
+                "event": "run_due",
+                "status": "config_error",
+                "exit_code": 1,
+                "checked_at_utc": checked_at.isoformat(),
+                "reason": "--run-due requires an explicit --config file",
+            }
+        )
+        return 1
+    if not args.slot_date:
+        _emit_status(
+            {
+                "event": "run_due",
+                "status": "config_error",
+                "exit_code": 1,
+                "checked_at_utc": checked_at.isoformat(),
+                "reason": "--run-due requires --slot-date YYYY-MM-DD (the intended Paris date)",
+            }
+        )
+        return 1
+    slot_date: date | None = None
+    date_error = ""
+    try:
+        candidate = date.fromisoformat(args.slot_date)
+    except ValueError as exc:
+        date_error = (
+            f"--slot-date must be YYYY-MM-DD in the Paris calendar, got {args.slot_date!r}: {exc}"
+        )
+    else:
+        if candidate.isoformat() != args.slot_date:
+            date_error = f"--slot-date must be zero-padded YYYY-MM-DD, got {args.slot_date!r}"
+        else:
+            slot_date = candidate
+    if slot_date is None:
+        _emit_status(
+            {
+                "event": "run_due",
+                "status": "config_error",
+                "exit_code": 1,
+                "checked_at_utc": checked_at.isoformat(),
+                "reason": date_error,
+            }
+        )
+        return 1
+
+    try:
+        cfg = load_config_strict(
+            args.config,
+            database_url=args.database_url,
+            run_at=args.run_at,
+            timezone=args.timezone,
+            production_schedule_name=args.production_schedule_name,
+        )
+        validate_study_profile_paths(cfg)
+    except Exception as exc:  # noqa: BLE001 - report every config failure as JSON
+        _emit_status(
+            {
+                "event": "run_due",
+                "status": "config_error",
+                "exit_code": 1,
+                "checked_at_utc": checked_at.isoformat(),
+                "reason": str(exc),
+            }
+        )
+        return 1
+
+    cfg.ensure_dirs()
+    daemon = SchedulerDaemon(cfg)
+    try:
+        result = daemon.run_due(slot_date=slot_date, now=checked_at)
+    except Exception as exc:  # noqa: BLE001 - the workflow needs an exit code, not a traceback
+        log.error("scheduler.run_due_failed", error=repr(exc))
+        _emit_status(
+            {
+                "event": "run_due",
+                "status": "failed",
+                "exit_code": 1,
+                "checked_at_utc": checked_at.isoformat(),
+                "slot_date_paris": slot_date.isoformat(),
+                "study_profile": cfg.study_profile,
+                "production_schedule_name": cfg.production_schedule_name,
+                "reason": repr(exc),
+            }
+        )
+        return 1
+    _emit_status(result)
+    return int(result.get("exit_code", 1))
+
+
 def main(argv: list[str] | None = None) -> int:
     import argparse
 
@@ -492,7 +995,23 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="print the next trigger instant and exit",
     )
+    parser.add_argument(
+        "--run-due",
+        action="store_true",
+        help=(
+            "one-shot: observe the slot named by --slot-date if it is due, publish "
+            "the snapshot, and exit with a machine-readable status"
+        ),
+    )
+    parser.add_argument(
+        "--slot-date",
+        default=None,
+        help="YYYY-MM-DD Paris calendar date of the intended daily slot",
+    )
     args = parser.parse_args(argv)
+
+    if args.run_due:
+        return _run_due_cli(args)
 
     cfg = load_config(
         args.config,
