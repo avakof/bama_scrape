@@ -18,7 +18,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Any
+
+from selectolax.lexbor import LexborHTMLParser, LexborNode
 
 from bama_scraper.detail_parser import extract_json_ld, extract_nuxt_payload
 from bama_scraper.normalization import (
@@ -88,6 +91,87 @@ def condition_from_json_ld(blocks: list[dict[str, Any]]) -> str | None:
     return None
 
 
+#: Provenance label for :func:`extract_display_price` output.
+DISPLAY_PRICE_SOURCE = "html_listing_header_price"
+
+#: Class tokens that identify the listing-header price component. Matched as a
+#: *subset* of each element's tokens, so ordering and added utility classes do
+#: not matter. Taken from a sanitized live capture (2026-11-20 commissioning
+#: probe, two cash listings): row > column > header.
+_PRICE_ROW_TOKENS = frozenset({"flex", "items-center"})
+_PRICE_COLUMN_TOKENS = frozenset({"flex", "flex-col"})
+_HEADER_TOKENS = frozenset({"flex", "items-end", "self-stretch"})
+_TOMAN_WORD = "تومان"
+
+
+def _tokens(node: LexborNode | None) -> frozenset[str]:
+    if node is None or node.tag != "div":
+        return frozenset()
+    return frozenset((node.attributes.get("class") or "").split())
+
+
+def _node_text(node: LexborNode) -> str:
+    return normalize_text(node.text(separator=" ", strip=True)) or ""
+
+
+def extract_display_price(html: str) -> dict[str, Any] | None:
+    """The listing's displayed current price, paired with its own currency word.
+
+    On a cash listing the page header renders the asking price as a number with
+    an adjacent, separate ``<span>تومان</span>``. This returns
+    ``{"amount_text", "unit_text", "source", "candidates"}`` for that component
+    and ``None`` for anything less certain. Deliberately narrow:
+
+    * the unit span's text must be exactly ``تومان``;
+    * its parent row must contain nothing but ``<number> تومان`` (nested spans
+      are fine), and the row's column wrapper must contain nothing else either;
+    * the column must sit in the listing-header container, and that header must
+      contain no second ``تومان`` (a deposit or second figure would make the
+      pairing ambiguous);
+    * every matching component on the page must show the same amount.
+
+    The number is returned verbatim; validating its format is the caller's job.
+    JSON-LD ``priceCurrency`` is *not* consulted: live pages declared ``IRR`` for
+    the same figure the header shows in Toman.
+    """
+    if not html:
+        return None
+    try:
+        tree = LexborHTMLParser(html)
+    except Exception:  # noqa: BLE001 - unparseable HTML is simply "no evidence"
+        return None
+    found: list[str] = []
+    for span in tree.css("span"):
+        if _node_text(span) != _TOMAN_WORD:
+            continue
+        row = span.parent
+        column = row.parent if row is not None else None
+        header = column.parent if column is not None else None
+        if row is None or column is None or header is None:
+            continue
+        if not (
+            _PRICE_ROW_TOKENS <= _tokens(row)
+            and _PRICE_COLUMN_TOKENS <= _tokens(column)
+            and _HEADER_TOKENS <= _tokens(header)
+        ):
+            continue
+        row_text = _node_text(row)
+        match = re.fullmatch(rf"(\S+) {_TOMAN_WORD}", row_text)
+        if not match or _node_text(column) != row_text:
+            continue
+        if _node_text(header).count(_TOMAN_WORD) != 1:
+            continue
+        found.append(match.group(1))
+    if not found or len(set(found)) != 1:
+        return None
+    return {
+        "amount_text": found[0],
+        "unit_text": _TOMAN_WORD,
+        "source": DISPLAY_PRICE_SOURCE,
+        "candidates": len(found),
+    }
+
+
 def parse_ad_html(html: str, *, now_ts: float) -> dict[str, Any]:
     """Extract a flat field map plus media, raw attributes and warnings."""
     warnings: list[str] = []
@@ -115,6 +199,7 @@ def parse_ad_html(html: str, *, now_ts: float) -> dict[str, Any]:
             "sha256": digest,
             "ok": False,
             "agreements": {},
+            "display_price": extract_display_price(html),
         }
 
     safe, payload_redactions = scrub_payload(payload)
@@ -368,6 +453,9 @@ def parse_ad_html(html: str, *, now_ts: float) -> dict[str, Any]:
         "sha256": digest,
         "ok": True,
         "agreements": agreements,
+        # Kept out of ``fields`` on purpose: it is eligibility evidence, not an
+        # ``ad_deep`` column, and must not change the merged record.
+        "display_price": extract_display_price(html),
     }
 
 

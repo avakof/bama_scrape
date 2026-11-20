@@ -283,6 +283,26 @@ class DiscoveredCard:
     card_location: str | None = None
     card_image_url: str | None = None
     is_promoted: bool | None = None
+    # --- eligibility evidence (see bama_monitor.eligibility) -----------------
+    # Verbatim from the sighting that produced this card; never filled in from
+    # an older sighting. Deliberately excluded from ``card_hash`` so adding them
+    # does not change the legacy change-detection signal.
+    #: Offer type as the card typed it (``lumpsum``, ``installment``, ...).
+    card_price_type: str | None = None
+    #: ``toman``/``rial`` only when ``card_price_raw`` itself carries the word.
+    card_price_unit: str | None = None
+    #: Which observed text proved ``card_price_unit``.
+    card_price_unit_source: str | None = None
+    #: Body slug as the card reported it (e.g. ``passenger_car``).
+    card_body_type: str | None = None
+    #: A real boolean from the card, or ``None`` when the card is silent.
+    card_is_pre_sale: bool | None = None
+    #: Identifier of the discovery observation the evidence came from.
+    card_observation_id: str | None = None
+    #: ``False`` when the evidence row belongs to an earlier observation than the
+    #: one being assembled (a reused scratch database). ``None`` means the card
+    #: was built in memory, which is current by construction.
+    card_evidence_current: bool | None = None
 
     def card_hash(self) -> str:
         """Stable hash of the card's volatile content.

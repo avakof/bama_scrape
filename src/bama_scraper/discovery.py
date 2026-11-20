@@ -26,7 +26,13 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 from .config import Config
 from .logging_config import get_logger
 from .models import DiscoveredAd, NetworkCandidate
-from .normalization import normalize_mileage, normalize_price, normalize_text, parse_year
+from .normalization import (
+    normalize_mileage,
+    normalize_price,
+    normalize_text,
+    parse_unit_marked_amount,
+    parse_year,
+)
 from .storage import Storage
 
 log = get_logger(__name__)
@@ -177,6 +183,10 @@ def card_to_ad(
     price_toman = normalize_price(price_text) if price.get("type") == "lumpsum" else None
     year_text = detail.get("year")
     year_jalali, year_gregorian = parse_year(year_text)
+    price_display = normalize_text(str(price_text)) if price_text not in (None, "") else None
+    price_unit, price_unit_source = _observed_unit(price_display, "api_card_price_text")
+    body_type = detail.get("body_type")
+    is_pre_sale = detail.get("is_pre_sale")
 
     return DiscoveredAd(
         ad_id=ad_id,
@@ -184,7 +194,7 @@ def card_to_ad(
         source_search_url=search_url,
         card_title=normalize_text(detail.get("title")),
         card_subtitle=normalize_text(detail.get("subtitle")),
-        price_text=normalize_text(str(price_text)) if price_text not in (None, "") else None,
+        price_text=price_display,
         price_toman=price_toman,
         price_type=price.get("type"),
         year_text=normalize_text(str(year_text)) if year_text else None,
@@ -198,7 +208,25 @@ def card_to_ad(
         discovery_position=position,
         discovery_cycle=cycle,
         discovered_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
+        body_type=body_type if isinstance(body_type, str) and body_type else None,
+        is_pre_sale=is_pre_sale if isinstance(is_pre_sale, bool) else None,
+        price_unit=price_unit,
+        price_unit_source=price_unit_source,
     )
+
+
+def _observed_unit(price_text: str | None, source: str) -> tuple[str | None, str | None]:
+    """The currency this exact price text proves, with the text's provenance.
+
+    Only a strictly formatted ``<number> تومان|ریال`` string proves a unit. The
+    search API's ``price.price`` is a bare grouped number (verified on the
+    retained 2026-07-27 captures), so for API cards this returns ``(None, None)``
+    and the unit stays unproven rather than defaulted.
+    """
+    parsed = parse_unit_marked_amount(price_text)
+    if parsed is None:
+        return None, None
+    return parsed[1], source
 
 
 # ---------------------------------------------------------------------------
@@ -405,12 +433,15 @@ def _dom_card_to_ad(card: dict[str, Any], search_url: str, cycle: int) -> Discov
     price_line = next((x for x in lines if "تومان" in x or "،" in x and x.count("0") > 4), None)
     mileage_line = next((x for x in lines if "km" in x or "کیلومتر" in x), None)
     year_line = next((x for x in lines if re.fullmatch(r"\s*1[34]\d{2}\s*", x)), None)
+    price_unit, price_unit_source = _observed_unit(normalize_text(price_line), "dom_card_text")
     return DiscoveredAd(
         ad_id=ad_id,
         url=url,
         source_search_url=search_url,
         card_title=normalize_text(card.get("title")),
         card_subtitle=normalize_text(card.get("subtitle")),
+        price_unit=price_unit,
+        price_unit_source=price_unit_source,
         price_text=normalize_text(price_line),
         price_toman=normalize_price(price_line) if price_line else None,
         year_text=normalize_text(year_line),

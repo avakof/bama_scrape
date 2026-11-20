@@ -157,6 +157,122 @@ def normalize_price(text: str | int | float | None) -> int | None:
     return value if value > 0 else None
 
 
+# ---------------------------------------------------------------------------
+# Strict amounts (evidence grade)
+# ---------------------------------------------------------------------------
+#
+# ``normalize_price`` above is deliberately forgiving: it takes the first run of
+# digits it can find and assumes Toman. That is fine for the legacy dataset but
+# is not *proof* of anything — it will happily read a deposit, a phone number or
+# a rial figure as an asking price. The helpers below are the opposite: they
+# accept one well-formed number and nothing else, and return ``None`` on any
+# doubt. They never assume a unit.
+
+#: Thousands separators accepted inside a strictly grouped number.
+_STRICT_GROUP_SEPARATORS: Final[str] = ",٬،"
+
+#: Explicit currency words, mapped to their denomination. Only the formal spelling
+#: is accepted; colloquial or abbreviated forms are not evidence.
+CURRENCY_WORDS: Final[dict[str, str]] = {"تومان": "toman", "ریال": "rial"}
+
+#: Invisible marks a renderer may wrap around a number; they carry no meaning.
+_INVISIBLE_RE: Final[re.Pattern[str]] = re.compile("[‎‏‪-‮⁦-⁩﻿]")
+
+
+def _single_script_digits(text: str) -> str | None:
+    """ASCII digits for ``text`` if every digit comes from one script, else None.
+
+    A number mixing Persian and ASCII digits is not something a renderer emits;
+    it is a sign of concatenated or corrupted text, so it is rejected.
+    """
+    scripts = set()
+    for ch in text:
+        if ch in ASCII_DIGITS:
+            scripts.add("ascii")
+        elif ch in PERSIAN_DIGITS:
+            scripts.add("persian")
+        elif ch in ARABIC_DIGITS:
+            scripts.add("arabic")
+    if len(scripts) > 1:
+        return None
+    return convert_digits(text)
+
+
+def parse_strict_integer(value: object) -> int | None:
+    """Parse one non-negative integer amount, or ``None`` if it is not exactly one.
+
+    Accepts a JSON integer, an integral float, or a string of digits from a single
+    script (ASCII, Persian or Arabic-Indic) that is either ungrouped or grouped
+    in threes with one consistent separator (``,``, ``٬`` or ``،``). Rejects
+    signs, decimals, spaces inside the number, leading zeros, words, units and
+    booleans. A unit is never inferred.
+
+    >>> parse_strict_integer("۱٬۲۵۰٬۰۰۰٬۰۰۰")
+    1250000000
+    >>> parse_strict_integer("1,25,000") is None
+    True
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float):
+        if value != value or value in (float("inf"), float("-inf")):
+            return None
+        if not value.is_integer() or value < 0 or value > 2**53:
+            return None
+        return int(value)
+    if not isinstance(value, str):
+        return None
+    text = _INVISIBLE_RE.sub("", value).strip()
+    if not text:
+        return None
+    ascii_text = _single_script_digits(text)
+    if ascii_text is None:
+        return None
+    if re.fullmatch(r"\d+", ascii_text):
+        digits = ascii_text
+    else:
+        separators = {ch for ch in ascii_text if not ch.isdigit()}
+        if len(separators) != 1 or not separators <= set(_STRICT_GROUP_SEPARATORS):
+            return None
+        sep = re.escape(next(iter(separators)))
+        if not re.fullmatch(rf"\d{{1,3}}(?:{sep}\d{{3}})+", ascii_text):
+            return None
+        digits = re.sub(sep, "", ascii_text)
+    if len(digits) > 1 and digits.startswith("0"):
+        return None
+    return int(digits)
+
+
+def parse_unit_marked_amount(text: object) -> tuple[int, str] | None:
+    """Parse ``"<number> تومان"`` / ``"<number> ریال"`` into ``(amount, unit)``.
+
+    The whole string must be exactly one strictly formatted number followed by
+    one formal currency word: anything else (a prefix such as ``قیمت``, a
+    magnitude word such as ``میلیون``, a second number, a sign) returns ``None``.
+    The unit is read from the text itself and never defaulted.
+
+    >>> parse_unit_marked_amount("۱٬۰۰۰٬۰۰۰٬۰۰۱ تومان")
+    (1000000001, 'toman')
+    >>> parse_unit_marked_amount("1,000,000,001") is None
+    True
+    """
+    if not isinstance(text, str):
+        return None
+    cleaned = normalize_whitespace(_INVISIBLE_RE.sub("", normalize_chars(text)))
+    if not cleaned:
+        return None
+    words = "|".join(CURRENCY_WORDS)
+    match = re.fullmatch(rf"(?P<number>\S+)\s*(?P<unit>{words})", cleaned)
+    if not match:
+        return None
+    amount = parse_strict_integer(match.group("number"))
+    if amount is None:
+        return None
+    return amount, CURRENCY_WORDS[match.group("unit")]
+
+
 def normalize_mileage(text: str | int | float | None) -> int | None:
     """Convert a displayed mileage string to integer kilometres.
 

@@ -114,6 +114,28 @@ CREATE TABLE IF NOT EXISTS network_candidates (
     seen_at             TEXT
 );
 
+-- What the most recent sighting of each card said, replaced wholesale on every
+-- upsert. ``discovered_ads`` keeps its legacy COALESCE semantics (an older
+-- sighting's price survives a newer sighting without one); that is fine for a
+-- dataset but would let a stale observation lend a price type or amount to the
+-- current one, so eligibility evidence is read from here instead, filtered to
+-- the observation that produced it.
+CREATE TABLE IF NOT EXISTS discovery_observations (
+    url               TEXT PRIMARY KEY,
+    ad_id             TEXT NOT NULL,
+    observation_id    TEXT NOT NULL,
+    observed_at       TEXT,
+    price_text        TEXT,
+    price_toman       INTEGER,
+    price_type        TEXT,
+    price_unit        TEXT,
+    price_unit_source TEXT,
+    year_text         TEXT,
+    body_type         TEXT,
+    is_pre_sale       INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_obs_observation ON discovery_observations(observation_id);
+
 CREATE TABLE IF NOT EXISTS discovery_checkpoint (
     run_id      TEXT NOT NULL,
     key         TEXT NOT NULL,
@@ -131,7 +153,13 @@ def _now() -> str:
 class Storage:
     """Thin, explicit SQLite wrapper. No ORM, no hidden magic."""
 
-    def __init__(self, db_path: str | Path) -> None:
+    def __init__(self, db_path: str | Path, *, observation_id: str | None = None) -> None:
+        #: Labels the evidence rows this connection writes to
+        #: ``discovery_observations``. Defaults to the ``run_id`` passed to
+        #: :meth:`upsert_discovered`, which keeps legacy callers unchanged; a
+        #: caller that may reuse a database (the monitor resuming a slot) passes a
+        #: unique id so it can tell its own sightings from an earlier attempt's.
+        self.observation_id = observation_id
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(self.db_path, timeout=60.0)
@@ -257,6 +285,31 @@ class Storage:
                  is_promoted   = COALESCE(excluded.is_promoted, is_promoted),
                  updated_at    = excluded.updated_at""",
             rows,
+        )
+        observation_id = self.observation_id or run_id
+        self.conn.executemany(
+            """INSERT OR REPLACE INTO discovery_observations
+               (url, ad_id, observation_id, observed_at, price_text, price_toman,
+                price_type, price_unit, price_unit_source, year_text, body_type,
+                is_pre_sale)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            [
+                (
+                    a.url,
+                    a.ad_id,
+                    observation_id,
+                    _now(),
+                    a.price_text,
+                    a.price_toman,
+                    a.price_type,
+                    a.price_unit,
+                    a.price_unit_source,
+                    a.year_text,
+                    a.body_type,
+                    int(a.is_pre_sale) if a.is_pre_sale is not None else None,
+                )
+                for a in ads
+            ],
         )
         self.conn.commit()
         return len(set(urls) - existing)

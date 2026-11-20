@@ -16,7 +16,9 @@ even when the run is later judged invalid.
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import sys
+import uuid
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -90,6 +92,93 @@ def build_discovery_result(
     )
 
 
+def is_nationwide_profile(cfg: Any) -> bool:
+    """Whether ``cfg`` opted into the nationwide evidence profile.
+
+    Read defensively: configurations that predate ``study_profile`` are legacy.
+    """
+    from .eligibility import NATIONWIDE_PROFILE
+
+    return getattr(cfg, "study_profile", "legacy") == NATIONWIDE_PROFILE
+
+
+_CARD_COLUMNS = (
+    "d.ad_id, d.url, d.card_title, d.price_text, d.price_toman, d.year_text,"
+    " d.mileage_text, d.mileage_km, d.location_text, d.thumbnail_url, d.is_promoted,"
+    " d.discovery_position, d.discovery_cycle,"
+    " o.observation_id AS obs_id, o.price_text AS obs_price_text,"
+    " o.price_toman AS obs_price_toman, o.price_type AS obs_price_type,"
+    " o.price_unit AS obs_price_unit, o.price_unit_source AS obs_price_unit_source,"
+    " o.year_text AS obs_year_text, o.body_type AS obs_body_type,"
+    " o.is_pre_sale AS obs_is_pre_sale"
+)
+
+
+def read_discovered_cards(
+    conn: sqlite3.Connection, *, observation_id: str, current_only: bool
+) -> list[sqlite3.Row]:
+    """Card rows from a discovery scratch database, with their observation evidence.
+
+    ``current_only`` (the nationwide profile) keeps only cards sighted by
+    ``observation_id``: a row an earlier attempt left in a reused database is
+    not part of this observation and must not be reported as seen. The legacy
+    path returns every row, exactly as before.
+    """
+    sql = (
+        f"SELECT {_CARD_COLUMNS} FROM discovered_ads d"
+        " LEFT JOIN discovery_observations o ON o.url = d.url"
+    )
+    params: tuple[Any, ...] = ()
+    if current_only:
+        sql += " WHERE o.observation_id = ?"
+        params = (observation_id,)
+    sql += " ORDER BY d.discovery_cycle, d.discovery_position"
+    return list(conn.execute(sql, params))
+
+
+def card_from_row(
+    row: sqlite3.Row, *, observation_id: str, nationwide: bool = False
+) -> DiscoveredCard:
+    """Build a :class:`DiscoveredCard` from :func:`read_discovered_cards` output.
+
+    The evidence fields come only from the observation row and are marked stale
+    when that row belongs to another observation, so an older sighting can never
+    lend its offer type, unit, year or body to this one.
+
+    Under the legacy profile the price and year fields keep their legacy source
+    (the COALESCEd ``discovered_ads`` columns), exactly as before. Under the
+    nationwide profile they are taken from the current sighting instead, because
+    a COALESCEd column can still hold an older sighting's value.
+    """
+    obs_id = row["obs_id"]
+    current = obs_id is not None and obs_id == observation_id
+    use_observed = nationwide and current
+    pre_sale = row["obs_is_pre_sale"]
+    return DiscoveredCard(
+        platform_ad_id=row["ad_id"],
+        canonical_url=row["url"],
+        position=row["discovery_position"],
+        page_number=row["discovery_cycle"],
+        scroll_cycle=row["discovery_cycle"],
+        card_title=row["card_title"],
+        card_price_raw=row["obs_price_text"] if use_observed else row["price_text"],
+        card_price_normalized=row["obs_price_toman"] if use_observed else row["price_toman"],
+        card_year=row["obs_year_text"] if use_observed else row["year_text"],
+        card_mileage_raw=row["mileage_text"],
+        card_mileage_normalized=row["mileage_km"],
+        card_location=row["location_text"],
+        card_image_url=row["thumbnail_url"],
+        is_promoted=bool(row["is_promoted"]) if row["is_promoted"] is not None else None,
+        card_price_type=row["obs_price_type"],
+        card_price_unit=row["obs_price_unit"],
+        card_price_unit_source=row["obs_price_unit_source"],
+        card_body_type=row["obs_body_type"],
+        card_is_pre_sale=bool(pre_sale) if pre_sale is not None else None,
+        card_observation_id=obs_id,
+        card_evidence_current=current,
+    )
+
+
 class BamaDiscoveryScraper:
     """Wraps the verified API-based discovery pass."""
 
@@ -116,39 +205,25 @@ class BamaDiscoveryScraper:
             max_runtime=self.cfg.max_run_seconds,
         )
         scraper_cfg.ensure_dirs()
-        storage = Storage(scraper_cfg.db_path)
+        # A resumed slot reuses this run's evidence directory, and with it the
+        # scratch database. A fresh observation id per pass lets the evidence
+        # written now be told apart from rows an earlier attempt left behind.
+        observation_id = f"monitor-{uuid.uuid4().hex}"
+        nationwide = is_nationwide_profile(self.cfg)
+        storage = Storage(scraper_cfg.db_path, observation_id=observation_id)
         try:
             storage.start_run("monitor", search_url, {}, "api", "monitor")
             outcome = discover_via_api(
                 scraper_cfg, storage, "monitor", max_pages=self.cfg.max_discovery_pages
             )
-            rows = storage.conn.execute(
-                "SELECT ad_id, url, card_title, price_text, price_toman, year_text,"
-                " mileage_text, mileage_km, location_text, thumbnail_url, is_promoted,"
-                " discovery_position, discovery_cycle FROM discovered_ads"
-                " ORDER BY discovery_cycle, discovery_position"
-            ).fetchall()
+            rows = read_discovered_cards(
+                storage.conn, observation_id=observation_id, current_only=nationwide
+            )
         finally:
             storage.close()
 
         cards = [
-            DiscoveredCard(
-                platform_ad_id=row["ad_id"],
-                canonical_url=row["url"],
-                position=row["discovery_position"],
-                page_number=row["discovery_cycle"],
-                scroll_cycle=row["discovery_cycle"],
-                card_title=row["card_title"],
-                card_price_raw=row["price_text"],
-                card_price_normalized=row["price_toman"],
-                card_year=row["year_text"],
-                card_mileage_raw=row["mileage_text"],
-                card_mileage_normalized=row["mileage_km"],
-                card_location=row["location_text"],
-                card_image_url=row["thumbnail_url"],
-                is_promoted=bool(row["is_promoted"]) if row["is_promoted"] is not None else None,
-            )
-            for row in rows
+            card_from_row(row, observation_id=observation_id, nationwide=nationwide) for row in rows
         ]
 
         return build_discovery_result(
@@ -294,6 +369,21 @@ class BamaDetailScraper:
                 # The API answered but the page did not: treat as still-active
                 # rather than removed, and record the inconsistency.
                 error = "html unavailable while api responded"
+            except BlockedError as exc:
+                if not is_nationwide_profile(self.cfg):
+                    error = repr(exc)  # legacy behaviour, unchanged
+                else:
+                    # An explicit denial is not an observation. Surface it so the
+                    # run can stop, and return no fields: the API half alone must
+                    # not be passed on as if the page had been read.
+                    return DetailResult(
+                        platform_ad_id=ad_id,
+                        url=advertisement_url,
+                        ok=False,
+                        verdict=DetailVerdict.BLOCKED,
+                        http_status=status_code,
+                        error=f"html stage blocked after api success: {exc}",
+                    )
             except Exception as exc:  # noqa: BLE001
                 error = repr(exc)
 
@@ -321,12 +411,39 @@ class BamaDetailScraper:
             ok=True,
             verdict=verdict,
             http_status=status_code or 200,
-            fields=merged.record,
+            fields={**merged.record, **display_price_fields(html_result)},
             media=merged.media,
+            # Hashed over the merged record only, so the display evidence added to
+            # ``fields`` does not change the legacy change-detection signal.
             content_hash=_content_hash(merged.record),
             parser_version=str(merged.record.get("deep_version") or "1.0.0"),
             error=error,
         )
+
+
+#: ``DetailResult.fields`` keys carrying the header's displayed price. Read by
+#: :func:`bama_monitor.eligibility.assess_detail`; never part of ``ad_deep``.
+DISPLAY_PRICE_KEYS = (
+    "price_display_amount_text",
+    "price_display_unit_text",
+    "price_display_source",
+)
+
+
+def display_price_fields(html_result: dict[str, Any] | None) -> dict[str, Any]:
+    """Flatten ``parse_ad_html``'s ``display_price`` into detail-field keys.
+
+    Empty when the page was not fetched or the header component was not found
+    unambiguously; absence is then visible as absence, never as a default.
+    """
+    display = (html_result or {}).get("display_price")
+    if not isinstance(display, dict):
+        return {}
+    return {
+        "price_display_amount_text": display.get("amount_text"),
+        "price_display_unit_text": display.get("unit_text"),
+        "price_display_source": display.get("source"),
+    }
 
 
 def _content_hash(record: dict[str, Any]) -> str:

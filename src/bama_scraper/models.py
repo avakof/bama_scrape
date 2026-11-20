@@ -57,6 +57,19 @@ class DiscoveredAd(_Base):
 
     status: AdStatus = "discovered"
 
+    # --- observation evidence ----------------------------------------------
+    # What *this* sighting of the card said, kept verbatim for eligibility
+    # decisions. Stored per observation (never COALESCEd with an older sighting)
+    # in ``discovery_observations``; the legacy columns above are untouched.
+    #: Body slug exactly as the card reported it (e.g. ``passenger_car``).
+    body_type: str | None = None
+    #: Only a real JSON boolean from the card; ``None`` when the card is silent.
+    is_pre_sale: bool | None = None
+    #: ``toman``/``rial`` only when ``price_text`` itself carries the currency word.
+    price_unit: str | None = None
+    #: Which observed text proved ``price_unit`` (``None`` when unproven).
+    price_unit_source: str | None = None
+
 
 class AdMedia(_Base):
     """One media item belonging to an advertisement."""
