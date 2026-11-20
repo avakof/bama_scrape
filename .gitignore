@@ -41,6 +41,7 @@ Thumbs.db
 # truth and it stays on the machine that collected it.
 # ---------------------------------------------------------------------------
 monitor_data/
+bama-nationwide-data/
 daily_snapshots/
 reports/
 deep_scraper/data/

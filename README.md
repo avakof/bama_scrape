@@ -92,7 +92,13 @@ The SQLite database in `output/` is the source of truth; CSV, JSONL, and Parquet
 files are exports. Read [Collect a dataset](docs/how-to/collect.md) before changing
 termination or request-rate settings.
 
-### Daily monitoring
+### Daily nationwide monitoring
+
+Run `python -m bama_monitor.nationwide --daily` to collect qualifying passenger-car listings
+at **13:00 Europe/Paris**. For installation, eligibility rules, exports, and the optional
+GitHub Actions schedule, see the [Python monitor guide](docs/how-to/nationwide-python.md).
+
+### Existing monitoring profiles
 
 ```bash
 python -m bama_monitor validate

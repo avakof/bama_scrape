@@ -22,6 +22,7 @@ that matches the job you are trying to do.
 - [Collect a one-time dataset](how-to/collect.md)
 - [Run deep enrichment](how-to/deep-enrichment.md)
 - [Operate the daily monitor](how-to/monitor.md)
+- [Run the nationwide monitor in Python](how-to/nationwide-python.md)
 - [Deploy, back up, and recover](how-to/deploy-and-recover.md)
 - [Run EDA](how-to/analyze.md)
 - [Run the Orca agent team](how-to/run-agent-team.md)
