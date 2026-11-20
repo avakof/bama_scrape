@@ -20,7 +20,7 @@ import re
 import time
 from typing import Any
 
-from selectolax.parser import HTMLParser
+from selectolax.lexbor import LexborHTMLParser
 
 from .models import AdDetail, AdMedia
 from .normalization import (
@@ -132,7 +132,7 @@ def extract_nuxt_payload(html: str) -> dict[str, Any] | None:
 def extract_json_ld(html: str) -> list[dict[str, Any]]:
     """Return all parseable JSON-LD blocks."""
     out: list[dict[str, Any]] = []
-    for node in HTMLParser(html).css('script[type="application/ld+json"]'):
+    for node in LexborHTMLParser(html).css('script[type="application/ld+json"]'):
         text = node.text()
         if not text:
             continue
