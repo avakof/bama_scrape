@@ -275,8 +275,9 @@ class BamaDetailScraper:
     argues against a sale, while 404/410 argues for removal.
     """
 
-    def __init__(self, cfg: MonitorConfig) -> None:
+    def __init__(self, cfg: MonitorConfig, *, target_count: int | None = None) -> None:
         self.cfg = cfg
+        self._target_count = target_count
         self._fetcher: Any = None
         self._deep_cfg: Any = None
 
@@ -292,6 +293,11 @@ class BamaDetailScraper:
             output_dir=self.cfg.output_dir / "deep",
             referer=self.cfg.search_url,
         )
+        if self._target_count is not None:
+            if self._target_count < 1:
+                raise ValueError("target_count must be positive")
+            # Each planned listing uses one detail JSON and at most one HTML fetch.
+            self._deep_cfg.max_requests = 2 * self._target_count
         self._fetcher = await DeepFetcher(self._deep_cfg).__aenter__()
         return self
 
@@ -341,6 +347,7 @@ class BamaDetailScraper:
             )
             error = message
         except BlockedError as exc:
+            self._fetcher.abort(str(exc))
             verdict, error = DetailVerdict.BLOCKED, str(exc)
         except BudgetExhaustedError as exc:
             verdict, error = DetailVerdict.UNKNOWN, str(exc)
@@ -365,6 +372,15 @@ class BamaDetailScraper:
                     verdict = DetailVerdict.EXPLICITLY_UNAVAILABLE
                 else:
                     html_result = parse_ad_html(html, now_ts=now)
+            except BlockedError as exc:
+                self._fetcher.abort(str(exc))
+                return DetailResult(
+                    platform_ad_id=ad_id,
+                    url=advertisement_url,
+                    ok=False,
+                    verdict=DetailVerdict.BLOCKED,
+                    error=str(exc),
+                )
             except PermanentFetchError:
                 # The API answered but the page did not: treat as still-active
                 # rather than removed, and record the inconsistency.

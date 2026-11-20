@@ -13,6 +13,7 @@ diagnosable trail.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -562,7 +563,12 @@ class DailyRunner:
         cap = policy.max_details_per_run
         by_id = {obs.platform_ad_id: obs for obs in absent}
         verification_targets = [
-            by_id[key] for _, key, _ in select_verification_targets(missing, self.cfg)
+            by_id[key]
+            for _, key, _ in select_verification_targets(
+                missing,
+                self.cfg,
+                limit=len(missing) if policy.check_every_advertisement_daily else cap,
+            )
         ]
         if policy.check_every_advertisement_daily:
             targets = candidates + verification_targets
@@ -572,49 +578,70 @@ class DailyRunner:
         if not targets:
             return []
 
-        checks = []
+        width = policy.concurrency
+        if width <= 0:
+            raise ValueError("detail concurrency must be positive")
+        remaining = iter(enumerate(targets))
+        completed: dict[int, tuple[StudyObservation, DetailResult, datetime, int]] = {}
+        blocked = asyncio.Event()
         self.repo.update_run(context.run_id, detail_started_at=utcnow())
-        factory = self._detail_scraper_factory or self._default_detail_factory
-        async with factory() as scraper:
-            for observation in targets:
-                started = utcnow()
-                try:
-                    result = await scraper.scrape(observation.url)
-                except Exception as exc:  # noqa: BLE001 - keep the candidate evidence
-                    result = DetailResult(
-                        observation.platform_ad_id,
-                        observation.url,
-                        ok=False,
-                        verdict=DetailVerdict.TEMPORARY_ERROR,
-                        error=repr(exc),
-                    )
-                elapsed_ms = int((utcnow() - started).total_seconds() * 1000)
-                checks.append((observation, result, started, elapsed_ms))
-                is_candidate = observation.card is not None
-                observation.source = "detail"
-                observation.price_toman = None
-                if result.verdict in STRONG_REMOVAL_VERDICTS or (
-                    result.verdict is DetailVerdict.EXPLICITLY_UNAVAILABLE
-                    and result.http_status == 200
-                ):
-                    observation.status = "gone" if is_candidate else "missing"
-                    observation.reason = str(result.verdict)
-                elif result.ok and result.verdict is DetailVerdict.STILL_ACTIVE:
-                    assessment = assess_detail(result.fields)
-                    observation.status = assessment.status
-                    observation.reason = assessment.reason
-                    observation.price_toman = assessment.price_toman
-                    observation.source = "live_detail"
-                    if assessment.status == "unknown" and (result.error or not result.fields):
-                        observation.source = "detail"
-                    if not is_candidate and assessment.status == "qualified":
-                        observation.status = "unknown"
-                        observation.reason = "live_qualifying_detail_absent_from_search"
-                else:
+        manager = (
+            self._detail_scraper_factory()
+            if self._detail_scraper_factory is not None
+            else self._default_detail_factory(target_count=len(targets))
+        )
+        async with manager as scraper:
+
+            async def consume() -> None:
+                for index, observation in remaining:
+                    if blocked.is_set():
+                        return
+                    started = utcnow()
+                    try:
+                        result = await scraper.scrape(observation.url)
+                    except Exception as exc:  # noqa: BLE001 - keep the candidate evidence
+                        result = DetailResult(
+                            observation.platform_ad_id,
+                            observation.url,
+                            ok=False,
+                            verdict=DetailVerdict.TEMPORARY_ERROR,
+                            error=repr(exc),
+                        )
+                    elapsed_ms = int((utcnow() - started).total_seconds() * 1000)
+                    completed[index] = observation, result, started, elapsed_ms
+                    if result.verdict is DetailVerdict.BLOCKED:
+                        blocked.set()
+                        return
+
+            async with asyncio.TaskGroup() as workers:
+                for _ in range(min(width, len(targets))):
+                    workers.create_task(consume())
+
+        # Apply evidence in discovery/verification order regardless of network timing.
+        checks = [completed[index] for index in sorted(completed)]
+        for observation, result, _, _ in checks:
+            is_candidate = observation.card is not None
+            observation.source = "detail"
+            observation.price_toman = None
+            if result.verdict in STRONG_REMOVAL_VERDICTS or (
+                result.verdict is DetailVerdict.EXPLICITLY_UNAVAILABLE and result.http_status == 200
+            ):
+                observation.status = "gone" if is_candidate else "missing"
+                observation.reason = str(result.verdict)
+            elif result.ok and result.verdict is DetailVerdict.STILL_ACTIVE:
+                assessment = assess_detail(result.fields)
+                observation.status = assessment.status
+                observation.reason = assessment.reason
+                observation.price_toman = assessment.price_toman
+                observation.source = "live_detail"
+                if assessment.status == "unknown" and (result.error or not result.fields):
+                    observation.source = "detail"
+                if not is_candidate and assessment.status == "qualified":
                     observation.status = "unknown"
-                    observation.reason = str(result.verdict)
-                if result.verdict is DetailVerdict.BLOCKED:
-                    break
+                    observation.reason = "live_qualifying_detail_absent_from_search"
+            else:
+                observation.status = "unknown"
+                observation.reason = str(result.verdict)
         return checks
 
     def _persist_study_detail(
@@ -811,11 +838,11 @@ class DailyRunner:
 
     # -- detail phase ------------------------------------------------------
 
-    def _default_detail_factory(self) -> Any:
+    def _default_detail_factory(self, *, target_count: int | None = None) -> Any:
         """The production detail scraper, as an async context manager."""
         from .scrapers import BamaDetailScraper
 
-        return BamaDetailScraper(self.cfg)
+        return BamaDetailScraper(self.cfg, target_count=target_count)
 
     def _select_detail_targets(
         self, context: RunContext, comparison: ComparisonResult
