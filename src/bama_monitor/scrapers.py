@@ -347,7 +347,8 @@ class BamaDetailScraper:
             )
             error = message
         except BlockedError as exc:
-            self._fetcher.abort(str(exc))
+            if self._target_count is not None:
+                self._fetcher.abort(str(exc))
             verdict, error = DetailVerdict.BLOCKED, str(exc)
         except BudgetExhaustedError as exc:
             verdict, error = DetailVerdict.UNKNOWN, str(exc)
@@ -372,15 +373,6 @@ class BamaDetailScraper:
                     verdict = DetailVerdict.EXPLICITLY_UNAVAILABLE
                 else:
                     html_result = parse_ad_html(html, now_ts=now)
-            except BlockedError as exc:
-                self._fetcher.abort(str(exc))
-                return DetailResult(
-                    platform_ad_id=ad_id,
-                    url=advertisement_url,
-                    ok=False,
-                    verdict=DetailVerdict.BLOCKED,
-                    error=str(exc),
-                )
             except PermanentFetchError:
                 # The API answered but the page did not: treat as still-active
                 # rather than removed, and record the inconsistency.
@@ -392,6 +384,8 @@ class BamaDetailScraper:
                     # An explicit denial is not an observation. Surface it so the
                     # run can stop, and return no fields: the API half alone must
                     # not be passed on as if the page had been read.
+                    if self._target_count is not None:
+                        self._fetcher.abort(str(exc))
                     return DetailResult(
                         platform_ad_id=ad_id,
                         url=advertisement_url,

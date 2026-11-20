@@ -86,6 +86,7 @@ async def test_html_block_is_reported_and_stops_the_shared_detail_fetcher(cfg, m
     monkeypatch.setattr(net.DeepFetcher, "fetch_json", get_json)
     monkeypatch.setattr(net.DeepFetcher, "fetch_html", get_html)
     monkeypatch.setattr(ad_api, "parse_ad_api", lambda data, now_ts: {})
+    cfg.study_profile = "nationwide_passenger_v1"
     async with BamaDetailScraper(cfg, target_count=1) as scraper:
         result = await scraper.scrape("https://bama.ir/car/detail-abcd1234-example")
         assert result.verdict is DetailVerdict.BLOCKED
