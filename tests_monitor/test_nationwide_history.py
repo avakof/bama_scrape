@@ -15,6 +15,7 @@ from bama_monitor.db import Database, connect
 from bama_monitor.models import DetailResult, DetailVerdict, DiscoveryResult, EventType, RunHealth
 from bama_monitor.repository import Repository
 from bama_monitor.runner import DailyRunner, RunOutcome
+from bama_monitor.scrapers import BamaDetailScraper
 
 FLOOR = 1_000_000_000
 ABOVE = FLOOR + 50_000_000
@@ -379,8 +380,6 @@ async def test_mixed_cash_and_unresolved_candidates_publish_verified_cohort(
 
     from bama_deep import net
 
-    from bama_monitor.scrapers import BamaDetailScraper
-
     keys = ("cash01", "neg02", "amb03")
     calls: list[tuple[str, str]] = []
 
@@ -447,7 +446,20 @@ async def test_mixed_cash_and_unresolved_candidates_publish_verified_cohort(
         assert result["exported"]
         from pathlib import Path
 
-        summary = json.loads((Path(result["destination"]) / "run_summary.json").read_text())
+        import pandas as pd
+
+        directory = Path(result["destination"])
+        for inventory in (
+            pd.read_csv(directory / "inventory.csv"),
+            pd.read_parquet(directory / "inventory.parquet"),
+        ):
+            assert inventory["advertisement_id"].tolist() == ["cash01"]
+            assert inventory["eligible_price_toman"].tolist() == [ABOVE]
+        decisions = pd.read_csv(directory / "eligibility.csv").set_index("advertisement_id")
+        assert set(decisions.index) == set(keys)
+        assert decisions.loc["cash01", "eligibility_status"] == "qualified"
+        assert decisions.loc["amb03", "eligibility_reason"]
+        summary = json.loads((directory / "run_summary.json").read_text())
         assert summary["candidate_count"] == 3
         assert summary["counters"]["active_count"] == 1
         assert summary["candidate_eligibility_counts"] == {"qualified": 1, "unknown": 2}

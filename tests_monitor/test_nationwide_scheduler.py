@@ -118,6 +118,11 @@ class _FakeDetailScraper:
                 "title": "nationwide car",
                 "price_text": "2,000,000,000",
                 "price_toman": 2_000_000_000,
+                "price_type": "lumpsum",
+                "api_raw_json": {"price.type": "lumpsum", "price.price": "2,000,000,000"},
+                "price_display_amount_text": "2,000,000,000",
+                "price_display_unit_text": "تومان",
+                "body_type": "passenger_car",
                 "year_text": "1398",
                 "seller_type": "dealer",
             },
@@ -524,6 +529,55 @@ class TestRunDueContract:
         assert result["status"] == "locked"
         assert result["exit_code"] == 1
         assert db.scalar("SELECT COUNT(*) FROM monitoring_runs") == 0
+
+    def test_existing_legacy_history_at_a_new_path_is_rejected(self, tmp_path: Path, db) -> None:
+        cfg = _portable_config(tmp_path, db)
+        legacy = MonitorConfig()
+        day = date(2026, 11, 20)
+        slot = slot_for_paris_date(cfg, day)
+        Repository(db).create_or_get_run(
+            search_url=legacy.search_url,
+            scheduled_for=slot,
+            timezone=legacy.timezone,
+            configuration_hash=legacy.configuration_hash(),
+            scraper_version="test",
+            monitor_version="test",
+            previous_valid_run_id=None,
+            trigger_type="scheduled",
+            production_schedule_name=legacy.production_schedule_name,
+        )
+        result = _daemon(cfg).run_due(slot_date=day, now=slot, db=db)
+        assert result["status"] == "profile_error"
+        assert db.scalar("SELECT COUNT(*) FROM monitoring_runs") == 1
+
+    def test_replay_after_only_latest_snapshot_is_restored(self, tmp_path: Path, db) -> None:
+        cfg = _portable_config(tmp_path, db)
+        daemon = _daemon(cfg)
+        first = date(2026, 11, 19)
+        second = date(2026, 11, 20)
+        published = [
+            daemon.run_due(
+                slot_date=day,
+                now=_on_time(daemon, day),
+                db=db,
+                discovery_scraper=_FakeDiscoveryScraper(cfg, tmp_path / "evidence", count=2),
+                detail_scraper_factory=_FakeDetailScraper,
+            )
+            for day in (first, second)
+        ]
+        assert [result["status"] for result in published] == ["completed", "completed"]
+        first_dir = Path(published[0]["snapshot"]["destination"])
+        first_dir.rename(tmp_path / "archived-first-slot")
+        pointer = cfg.daily_snapshot_dir / "latest_valid.json"
+        before = pointer.read_bytes()
+        retry = daemon.run_due(slot_date=first, now=_on_time(daemon, second), db=db)
+        assert retry["status"] == "already_settled"
+        assert not first_dir.exists()
+        assert pointer.read_bytes() == before
+        assert db.scalar("SELECT COUNT(*) FROM monitoring_runs") == 2
+        Path(published[1]["snapshot"]["destination"], "manifest.json").unlink()
+        damaged = daemon.run_due(slot_date=second, now=_on_time(daemon, second), db=db)
+        assert damaged["exit_code"] != 0
 
     def test_a_profile_mismatch_refuses_to_mix_histories(self, tmp_path: Path, db) -> None:
         cfg = _portable_config(tmp_path, db)

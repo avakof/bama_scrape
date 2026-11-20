@@ -282,6 +282,16 @@ class MonitorConfig(BaseModel):
         return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
+def _config_from_mapping(data: dict[str, Any], **overrides: Any) -> MonitorConfig:
+    """Build a validated config from already-parsed YAML data."""
+    payload = dict(data)
+    payload.update({k: v for k, v in overrides.items() if v is not None})
+    for key in ("output_dir", "reports_dir", "lock_dir", "daily_snapshot_dir"):
+        if payload.get(key) is not None:
+            payload[key] = Path(payload[key])
+    return MonitorConfig(**payload)
+
+
 def load_config(path: str | Path | None = None, **overrides: Any) -> MonitorConfig:
     """Build a config from an optional YAML file plus overrides."""
     data: dict[str, Any] = {}
@@ -289,11 +299,7 @@ def load_config(path: str | Path | None = None, **overrides: Any) -> MonitorConf
         candidate = Path(path)
         if candidate.exists():
             data = yaml.safe_load(candidate.read_text(encoding="utf-8")) or {}
-    data.update({k: v for k, v in overrides.items() if v is not None})
-    for key in ("output_dir", "reports_dir", "lock_dir", "daily_snapshot_dir"):
-        if data.get(key) is not None:
-            data[key] = Path(data[key])
-    return MonitorConfig(**data)
+    return _config_from_mapping(data, **overrides)
 
 
 class ConfigFileError(ValueError):
@@ -324,7 +330,7 @@ def load_config_strict(path: str | Path, **overrides: Any) -> MonitorConfig:
     if not isinstance(data, dict):
         raise ConfigFileError(f"configuration file must be a YAML mapping: {candidate}")
     try:
-        return load_config(candidate, **overrides)
+        return _config_from_mapping(data, **overrides)
     except Exception as exc:  # pydantic validation errors carry the useful detail
         raise ConfigFileError(f"configuration file is invalid: {candidate}: {exc}") from exc
 

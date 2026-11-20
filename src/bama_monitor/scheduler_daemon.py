@@ -115,38 +115,54 @@ class SchedulerDaemon:
     def validate_profile_state(self, db: Database) -> None:
         """Refuse to append a profile series to a different series' history.
 
-        The configuration hash already changes with a non-legacy profile, so a
-        collision would create a second, parallel run column rather than
-        corrupting rows. That is still wrong: the slot unique index, the
-        production schedule marker and the published pointer would describe two
-        incompatible studies under one schedule name. This check makes the
-        mismatch a visible failure before any observation is made.
+        The database is the series' identity, not its filename. A restored copy
+        of the legacy database is still the legacy history even when it arrives
+        as ``monitor.sqlite`` in a new state directory, and a manual row from
+        that database is still a legacy observation. Checking only rows whose
+        production schedule name already matches this profile misses exactly
+        that case.
+
+        For a non-legacy profile, every existing schedule and run must therefore
+        belong to the same configuration hash. Same-profile manual rows are
+        allowed: they carry the current hash with no production schedule name.
+        Legacy deliberately keeps its previous tolerance: its old database may
+        contain runs from earlier monitor versions, and refusing to start after
+        an upgrade would be worse than the incomparability the hash records.
         """
         if self.cfg.study_profile == "legacy":
             return
-        repo = Repository(db)
-        schedule = repo.get_production_schedule(self.cfg.production_schedule_name)
+        current = self.cfg.configuration_hash()
+        schedule = db.fetchone(
+            "SELECT name, search_configuration_hash FROM production_schedule"
+            " WHERE name <> ?"
+            "    OR search_configuration_hash IS NULL"
+            "    OR search_configuration_hash <> ?"
+            " ORDER BY name LIMIT 1",
+            [self.cfg.production_schedule_name, current],
+        )
         if schedule is not None:
-            recorded = schedule.get("search_configuration_hash")
-            current = self.cfg.configuration_hash()
-            if recorded != current:
-                raise ProfileMismatchError(
-                    f"production schedule {self.cfg.production_schedule_name!r} is "
-                    f"recorded with configuration_hash {recorded!r}, but this config "
-                    f"computes {current!r} (study_profile={self.cfg.study_profile!r}); "
-                    "refusing to mix series histories"
-                )
+            raise ProfileMismatchError(
+                f"database contains production schedule {schedule['name']!r} with "
+                f"configuration_hash {schedule['search_configuration_hash']!r}, not "
+                f"{current!r} for study_profile={self.cfg.study_profile!r}; "
+                "refusing to mix series histories"
+            )
         mismatched = db.fetchone(
-            "SELECT id, configuration_hash FROM monitoring_runs"
-            " WHERE production_schedule_name=? AND configuration_hash<>?"
+            "SELECT id, production_schedule_name, trigger_type, configuration_hash"
+            " FROM monitoring_runs"
+            " WHERE configuration_hash IS NULL"
+            "    OR configuration_hash <> ?"
+            "    OR (production_schedule_name IS NOT NULL AND production_schedule_name <> ?)"
             " ORDER BY id LIMIT 1",
-            [self.cfg.production_schedule_name, self.cfg.configuration_hash()],
+            [current, self.cfg.production_schedule_name],
         )
         if mismatched is not None:
             raise ProfileMismatchError(
-                f"run {mismatched['id']} under {self.cfg.production_schedule_name!r} "
-                f"used configuration_hash {mismatched['configuration_hash']!r}, not "
-                f"{self.cfg.configuration_hash()!r}; refusing to mix series histories"
+                f"run {mismatched['id']} "
+                f"(trigger={mismatched['trigger_type']!r}, "
+                f"schedule={mismatched['production_schedule_name']!r}) used "
+                f"configuration_hash {mismatched['configuration_hash']!r}, not "
+                f"{current!r}; refusing to mix series histories"
             )
 
     def todays_slot(self, *, now: datetime | None = None) -> datetime:
@@ -402,26 +418,32 @@ class SchedulerDaemon:
 
     @staticmethod
     def _run_times(db: Any, run_id: int | None) -> dict[str, Any]:
-        """Actual execution times from the run row, never the intended slot."""
+        """Actual execution times and native labels from the run row.
+
+        Only real timestamp columns are parsed. ``scheduled_date_paris`` is a
+        calendar label, ``scheduled_hour_paris`` is ``HH-MM`` text and
+        ``snapshot_export_path`` is a path; running them through the timestamp
+        parser merely fails and hands the value back, blurring the contract for
+        callers that need to distinguish a date from an instant.
+        """
         if run_id is None:
             return {}
         row = Repository(db).get_run(run_id) or {}
-        times: dict[str, Any] = {}
+        times = {
+            key: row.get(key)
+            for key in ("scheduled_date_paris", "scheduled_hour_paris", "snapshot_export_path")
+        }
         for key in (
             "scheduled_for",
-            "scheduled_date_paris",
-            "scheduled_hour_paris",
             "started_at",
             "finished_at",
             "discovery_started_at",
             "discovery_finished_at",
             "detail_started_at",
             "detail_finished_at",
-            "snapshot_export_path",
         ):
-            value = row.get(key)
-            parsed = parse_ts(value)
-            times[key] = parsed.isoformat() if parsed is not None else value
+            stamp = parse_ts(row.get(key))
+            times[key] = stamp.isoformat() if stamp else None
         return times
 
     # -- portable one-shot -------------------------------------------------
@@ -554,6 +576,59 @@ class SchedulerDaemon:
         )
         return self._executed_result(db, payload, base=base, trigger=trigger)
 
+    def _publication_state(
+        self,
+        run: dict[str, Any],
+        *,
+        pointer: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Did this run publish, and can its archive be verified locally?
+
+        A GitHub restore downloads only the newest snapshot. An older, genuinely
+        published slot keeps its publication path in the database but its
+        archive may not exist on this machine at all. The database is the source
+        of truth: ``snapshot_export_path`` is written only after an atomic export
+        succeeded, so a non-empty path is evidence of publication even when the
+        directory is remote.
+
+        That does not excuse a broken *local* archive. If a destination directory
+        is present but incomplete, or the current ``latest_valid.json`` target
+        has no manifest, reporting success would hide a damaged restore.
+        """
+        run_id = int(run["id"])
+        destination = run.get("snapshot_export_path")
+        pointer_id = pointer.get("run_id") if pointer else None
+        verified = False
+        reason = "no recorded publication or latest-valid snapshot"
+        if destination and pointer and pointer.get("path"):
+            # The restored pointer and manifest name the same published run.
+            # Only earlier archives may be absent from the local checkpoint.
+            try:
+                latest_dir = Path(pointer["path"])
+                latest = json.loads((latest_dir / "manifest.json").read_text(encoding="utf-8"))
+                if latest["run_id"] != pointer_id:
+                    raise ValueError("latest-valid manifest does not match the pointer")
+                folder = Path(destination)
+                if pointer_id == run_id:
+                    verified = folder.resolve() == latest_dir.resolve()
+                elif folder.exists():
+                    manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
+                    verified = manifest["run_id"] == run_id
+                else:
+                    latest_slot = parse_ts(pointer.get("scheduled_for"))
+                    original_slot = parse_ts(run.get("scheduled_for"))
+                    verified = bool(latest_slot and original_slot and original_slot < latest_slot)
+                reason = "slot already published" if verified else "inconsistent publication record"
+            except (OSError, KeyError, TypeError, ValueError) as exc:
+                reason = f"could not verify the published snapshot: {exc}"
+        return {
+            "exported": bool(destination),
+            "destination": destination,
+            "pointer_run_id": pointer_id,
+            "verified": verified,
+            "reason": reason,
+        }
+
     def _existing_run_result(
         self, db: Database, run: dict[str, Any], *, base: dict[str, Any]
     ) -> dict[str, Any]:
@@ -563,37 +638,28 @@ class SchedulerDaemon:
         run_id = int(run["id"])
         run_status = str(run.get("status") or "")
         pointer = read_latest_pointer(self.cfg)
-        destination = run.get("snapshot_export_path")
-        manifest = Path(destination) / "manifest.json" if destination else None
-        published = bool(manifest is not None and manifest.is_file())
+        publication = self._publication_state(run, pointer=pointer)
         result: dict[str, Any] = {
             **base,
             "action": "none",
             "run_id": run_id,
             "run_status": run_status,
             "run_times": self._run_times(db, run_id),
-            "snapshot": {
-                "exported": published,
-                "destination": destination,
-                "pointer_run_id": pointer.get("run_id") if pointer else None,
-            },
+            "snapshot": publication,
         }
-        if run_status == str(RunHealth.VALID) and published:
+        if run_status == str(RunHealth.VALID) and publication["verified"]:
             return {
                 **result,
                 "status": "already_settled",
                 "exit_code": 0,
-                "reason": "this slot already has a valid, published genuine run",
+                "reason": publication["reason"],
             }
         if run_status == str(RunHealth.VALID):
             return {
                 **result,
                 "status": "previous_run_unpublished",
                 "exit_code": 1,
-                "reason": (
-                    "a valid genuine run exists for this slot but its snapshot is "
-                    "missing; refusing to report success for an unpublished day"
-                ),
+                "reason": publication["reason"],
             }
         if run_status == str(RunHealth.RUNNING):
             return {

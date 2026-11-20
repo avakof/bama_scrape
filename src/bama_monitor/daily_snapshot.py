@@ -30,7 +30,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from .config import MonitorConfig
+from .config import NATIONWIDE_STUDY_PROFILE, MonitorConfig
 from .db import Database, parse_ts, utcnow
 from .models import ACCOUNTED_OUTCOMES, RunHealth
 from .repository import Repository
@@ -401,6 +401,24 @@ def export_daily_snapshot(
     rows: dict[str, int] = {}
     try:
         dataset = build_daily_dataset(db, run_id)
+        if run.get("study_profile") == NATIONWIDE_STUDY_PROFILE:
+            assessments = dataset.reindex(
+                columns=[
+                    "advertisement_id",
+                    "candidate_present",
+                    "was_seen",
+                    "eligibility_status",
+                    "eligibility_reason",
+                    "eligibility_source",
+                    "assessed_price_toman",
+                    "eligible_price_toman",
+                ]
+            )
+            rows["eligibility"] = _write_frame(assessments, staging / "eligibility.csv")
+            if not dataset.empty:
+                dataset = dataset.loc[
+                    dataset["was_seen"] & dataset["eligibility_status"].eq("qualified")
+                ]
         rows["inventory"] = _write_frame(dataset, staging / "inventory.csv")
         _write_frame(dataset, staging / "inventory.parquet", parquet=True)
 
