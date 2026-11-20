@@ -1,0 +1,81 @@
+name: Bama daily monitor
+
+on:
+  schedule:
+    - cron: '0 13 * * *'
+      timezone: Europe/Paris
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: bama-nationwide-passenger-v1
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    # Set the host variable after the storage credentials are in place.
+    if: >-
+      (github.event_name == 'schedule' && vars.HOSTINGER_HOST != '') ||
+      (github.event_name == 'workflow_dispatch' && github.ref_name == github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Install the monitor
+        run: python -m pip install -e . 'APScheduler>=3.10,<4' tzdata
+      - name: Configure storage access
+        env:
+          HOSTINGER_HOST: ${{ vars.HOSTINGER_HOST }}
+          HOSTINGER_PORT: ${{ vars.HOSTINGER_PORT }}
+          HOSTINGER_USER: ${{ vars.HOSTINGER_USER }}
+          HOSTINGER_SSH_KEY: ${{ secrets.HOSTINGER_SSH_KEY }}
+          HOSTINGER_HOST_FINGERPRINT: ${{ vars.HOSTINGER_HOST_FINGERPRINT }}
+        run: bash deploy/github-actions/configure-ssh.sh
+      - name: Restore the last committed observation
+        run: bash deploy/github-actions/state.sh restore "$RUNNER_TEMP/bama-state"
+      - name: Check the storage account
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          ssh -F "$BAMA_SSH_CONFIG" bama-store 'bash -se' <<'VERIFY'
+          umask 077
+          tmp=$(mktemp -d "$HOME/.bama-probe.XXXXXXXX")
+          trap 'rm -rf -- "$tmp"' EXIT
+          command -v rsync >/dev/null
+          echo probe > "$tmp/sample"
+          ln "$tmp/sample" "$tmp/link"
+          mv "$tmp/link" "$tmp/renamed"
+          cmp "$tmp/sample" "$tmp/renamed"
+          VERIFY
+      - name: Identify the original Paris slot
+        id: slot
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          created=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq .created_at)
+          date=$(python deploy/github-actions/slot_date.py "$created")
+          echo "date=$date" >> "$GITHUB_OUTPUT"
+      - name: Collect the due observation
+        id: collect
+        if: github.event_name == 'schedule'
+        env:
+          SLOT_DATE: ${{ steps.slot.outputs.date }}
+        run: |
+          cd "$RUNNER_TEMP/bama-state"
+          export BAMA_MONITOR_DATABASE_URL="sqlite:///$PWD/monitor.sqlite"
+          mkdir -p reports
+          logfile="reports/actions-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.log"
+          timeout --kill-after=60s 290m python -u -m bama_monitor.scheduler_daemon \
+            --config "$GITHUB_WORKSPACE/deploy/profiles/nationwide-passenger.yaml" \
+            --run-due --slot-date "$SLOT_DATE" >"$logfile" 2>&1
+      - name: Save the database, evidence and reports
+        if: ${{ !cancelled() && (steps.collect.outcome == 'success' || steps.collect.outcome == 'failure') }}
+        run: bash deploy/github-actions/state.sh save "$RUNNER_TEMP/bama-state"
