@@ -47,6 +47,7 @@ class Repository:
         scheduler_instance_id: str | None = None,
         scheduled_date_paris: str | None = None,
         scheduled_hour_paris: str | None = None,
+        study_profile: str = "legacy",
     ) -> tuple[int, bool]:
         """Create the run row, or resume the existing **production** run for a slot.
 
@@ -84,8 +85,8 @@ class Repository:
             " status, configuration_hash, scraper_version, monitor_version,"
             " previous_valid_run_id, trigger_type, is_synthetic,"
             " production_schedule_name, host_name, process_id, scheduler_instance_id,"
-            " scheduled_date_paris, scheduled_hour_paris, created_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " scheduled_date_paris, scheduled_hour_paris, created_at, study_profile)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             [
                 search_url,
                 now,
@@ -105,6 +106,7 @@ class Repository:
                 scheduled_date_paris,
                 scheduled_hour_paris,
                 now,
+                study_profile,
             ],
         )
         return run_id, True
@@ -321,7 +323,9 @@ class Repository:
                 out[key] = value
         return out
 
-    def comparison_population(self, configuration_hash: str) -> list[dict[str, Any]]:
+    def comparison_population(
+        self, configuration_hash: str, *, study: bool = False
+    ) -> list[dict[str, Any]]:
         """Advertisements eligible for an absence check.
 
         Restricted to the same search configuration and to states that are still
@@ -334,11 +338,13 @@ class Repository:
             str(AdStatus.REAPPEARED),
             str(AdStatus.MISSING_ONCE),
         ]
+        scope = "(search_configuration_hash IS NULL OR search_configuration_hash = ?)"
+        if study:
+            statuses.append(str(AdStatus.UNKNOWN))
+            scope = "search_configuration_hash = ? AND total_seen_runs > 0"
         placeholders = ",".join("?" * len(statuses))
         return self.db.fetchall(
-            "SELECT * FROM advertisements"
-            f" WHERE current_status IN ({placeholders})"
-            " AND (search_configuration_hash IS NULL OR search_configuration_hash = ?)",
+            f"SELECT * FROM advertisements WHERE current_status IN ({placeholders}) AND {scope}",
             [*statuses, configuration_hash],
         )
 
@@ -365,6 +371,7 @@ class Repository:
         was_seen: bool,
         observed_at: datetime,
         card: DiscoveredCard | None = None,
+        study_evidence: dict[str, Any] | None = None,
     ) -> None:
         """Append one observation. Unique on ``(run_id, advertisement_id)``.
 
@@ -394,11 +401,37 @@ class Repository:
                     "card_hash": card.card_hash(),
                 }
             )
+        if study_evidence is not None:
+            record.update(study_evidence)
         self.db.upsert(
             "daily_ad_observations",
             ["run_id", "advertisement_id"],
             record,
             update_columns=[],  # DO NOTHING: observations are immutable
+        )
+
+    def study_observation_counts(self, run_id: int) -> dict[str, int]:
+        return {
+            str(row["eligibility_status"]): int(row["count"])
+            for row in self.db.fetchall(
+                "SELECT eligibility_status, COUNT(*) AS count FROM daily_ad_observations"
+                " WHERE run_id=? AND candidate_present=?"
+                " AND eligibility_status IS NOT NULL"
+                " GROUP BY eligibility_status",
+                [run_id, True],
+            )
+        }
+
+    def previous_eligible_observation(
+        self, advertisement_id: int, before_run_id: int
+    ) -> dict[str, Any] | None:
+        return self.db.fetchone(
+            "SELECT o.* FROM daily_ad_observations o"
+            " JOIN monitoring_runs r ON r.id=o.run_id"
+            " WHERE o.advertisement_id=? AND o.run_id < ? AND o.was_seen=?"
+            " AND o.eligible_price_toman IS NOT NULL AND r.status=?"
+            " ORDER BY o.observed_at DESC, o.id DESC LIMIT 1",
+            [advertisement_id, before_run_id, True, str(RunHealth.VALID)],
         )
 
     def last_observation(self, advertisement_id: int) -> dict[str, Any] | None:
@@ -576,13 +609,25 @@ class Repository:
             },
         )
 
-    def consecutive_unavailable_checks(self, advertisement_id: int) -> int:
+    def consecutive_unavailable_checks(
+        self, advertisement_id: int, *, study_run_id: int | None = None
+    ) -> int:
         """How many of the most recent checks in a row said 404/410."""
-        rows = self.db.fetchall(
-            "SELECT verdict FROM detail_verifications WHERE advertisement_id=?"
-            " ORDER BY checked_at DESC LIMIT 10",
-            [advertisement_id],
-        )
+        if study_run_id is None:
+            rows = self.db.fetchall(
+                "SELECT verdict FROM detail_verifications WHERE advertisement_id=?"
+                " ORDER BY checked_at DESC LIMIT 10",
+                [advertisement_id],
+            )
+        else:
+            rows = self.db.fetchall(
+                "SELECT v.verdict FROM detail_verifications v"
+                " JOIN monitoring_runs r ON r.id=v.run_id"
+                " WHERE v.advertisement_id=? AND r.id <= ?"
+                " AND (r.status=? OR r.id=?)"
+                " ORDER BY v.checked_at DESC LIMIT 10",
+                [advertisement_id, study_run_id, str(RunHealth.VALID), study_run_id],
+            )
         count = 0
         for row in rows:
             if str(row["verdict"]) in ("http_404", "http_410"):

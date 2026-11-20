@@ -21,6 +21,7 @@ import json
 import os
 import shutil
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -102,6 +103,61 @@ def validate_run(db: Database, run_id: int) -> SnapshotValidation:
     status = str(run.get("status"))
     add("run_status_valid", status == str(RunHealth.VALID), f"status={status}")
 
+    study = run.get("candidate_count") is not None
+    if study:
+        counts = repo.study_observation_counts(run_id)
+        candidates = int(run["candidate_count"])
+        classified = sum(counts.values())
+        add(
+            "every_candidate_classified",
+            candidates > 0 and classified == candidates,
+            f"{classified}/{candidates} candidate(s) have a recorded assessment",
+        )
+        qualified = counts.get("qualified", 0)
+        add(
+            "qualified_cohort_nonempty",
+            qualified > 0,
+            f"{qualified} candidate(s) qualified",
+        )
+        seen = db.scalar(
+            "SELECT COUNT(*) FROM daily_ad_observations"
+            " WHERE run_id=? AND was_seen=? AND eligibility_status='qualified'"
+            " AND eligible_price_toman IS NOT NULL",
+            [run_id, True],
+        )
+        add(
+            "qualified_count_matches_valid_sightings",
+            qualified == seen == run["active_count"],
+            f"{seen} qualified sightings for {qualified} eligible candidate(s)",
+        )
+    else:
+        _check_legacy_detail_coverage(db, repo, run_id, add)
+
+    add(
+        "comparison_applied",
+        bool(run.get("comparison_applied")),
+        "inventory comparison completed transactionally",
+    )
+    add(
+        "termination_verified",
+        str(run.get("termination_reason") or "").startswith("api_exhausted"),
+        f"termination_reason={run.get('termination_reason')}",
+    )
+    add(
+        "provenance_complete",
+        all(run.get(f) for f in ("trigger_type", "started_at", "configuration_hash")),
+        "trigger_type, started_at and configuration_hash present",
+    )
+    blocked = str(run.get("termination_reason") or "").startswith("blocked_http")
+    add("not_blocked", not blocked, "no blocking response during discovery")
+
+    valid = all(c["passed"] for c in checks if c["blocking"])
+    return SnapshotValidation(valid, checks)
+
+
+def _check_legacy_detail_coverage(
+    db: Database, repo: Repository, run_id: int, add: Callable[[str, bool, str], None]
+) -> None:
     discovered = int(
         db.scalar(
             "SELECT COUNT(*) FROM daily_ad_observations WHERE run_id=? AND was_seen=?",
@@ -129,26 +185,6 @@ def validate_run(db: Database, run_id: int) -> SnapshotValidation:
         retryable == 0,
         f"{retryable} retryable detail failure(s) outstanding",
     )
-    add(
-        "comparison_applied",
-        bool(run.get("comparison_applied")),
-        "inventory comparison completed transactionally",
-    )
-    add(
-        "termination_verified",
-        str(run.get("termination_reason") or "").startswith("api_exhausted"),
-        f"termination_reason={run.get('termination_reason')}",
-    )
-    add(
-        "provenance_complete",
-        all(run.get(f) for f in ("trigger_type", "started_at", "configuration_hash")),
-        "trigger_type, started_at and configuration_hash present",
-    )
-    blocked = str(run.get("termination_reason") or "").startswith("blocked_http")
-    add("not_blocked", not blocked, "no blocking response during discovery")
-
-    valid = all(c["passed"] for c in checks if c["blocking"])
-    return SnapshotValidation(valid, checks)
 
 
 def build_daily_dataset(db: Database, run_id: int) -> pd.DataFrame:
@@ -175,6 +211,9 @@ def build_daily_dataset(db: Database, run_id: int) -> pd.DataFrame:
             "  a.published_at_source, a.left_truncated,"
             "  a.eligible_for_duration_ranking, a.filter_exit_reason,"
             "  o.observed_at AS card_observed_at, o.was_seen,"
+            "  r.status AS run_status, r.study_profile, o.candidate_present, o.eligibility_status,"
+            "  o.eligibility_reason, o.eligibility_source, o.assessed_price_toman, o.raw_card_price_normalized,"
+            "  o.eligible_price_toman, o.study_state_json,"
             "  o.card_title, o.card_price_raw, o.card_price_normalized,"
             "  o.card_year, o.card_mileage_normalized, o.card_location,"
             "  c.checked_at AS detail_checked_at, c.detail_http_status,"
@@ -197,6 +236,33 @@ def build_daily_dataset(db: Database, run_id: int) -> pd.DataFrame:
             [run_id],
         )
     )
+    if frame.empty:
+        return frame
+    if frame["study_profile"].iloc[0] == "legacy":
+        return frame.drop(
+            columns=[
+                "run_status",
+                "study_profile",
+                "candidate_present",
+                "eligibility_status",
+                "eligibility_reason",
+                "eligibility_source",
+                "assessed_price_toman",
+                "raw_card_price_normalized",
+                "eligible_price_toman",
+                "study_state_json",
+            ]
+        )
+
+    # Use the state captured at the end of the run. The current advertisement
+    # row may reflect later exits, re-entry, or sale inferences.
+    states = pd.DataFrame([db.json_load(value) or {} for value in frame.pop("study_state_json")])
+    frame[states.columns] = states
+    frame["price_normalized"] = frame["eligible_price_toman"]
+    frame["candidate_present"] = frame["candidate_present"].astype("boolean")
+    frame["was_seen"] = frame["was_seen"].astype("boolean")
+    for column in ("eligible_price_toman", "assessed_price_toman", "price_normalized"):
+        frame[column] = frame[column].astype("Int64")
     return frame
 
 
@@ -373,6 +439,11 @@ def export_daily_snapshot(
             ("removed_ads", "removal_confirmed"),
             ("reappeared_ads", "reappeared"),
             ("filter_exits", "filter_exit"),
+            *(
+                (("filter_reentries", "filter_reentry"),)
+                if run.get("candidate_count") is not None
+                else ()
+            ),
             ("reposts", "possible_repost"),
         ):
             rows[name] = _write_frame(
@@ -445,7 +516,25 @@ def _run_summary(
 ) -> dict[str, Any]:
     repo = Repository(db)
     counts = repo.detail_check_counts(int(run["id"]))
+    study = (
+        {
+            "study_profile": run["study_profile"],
+            "candidate_count": run["candidate_count"],
+            "candidate_resolution_rate": run["detail_coverage_rate"],
+            "candidate_eligibility_counts": repo.study_observation_counts(int(run["id"])),
+            "eligibility_reasons": db.fetchall(
+                "SELECT candidate_present, eligibility_status, eligibility_reason, COUNT(*) AS count"
+                " FROM daily_ad_observations WHERE run_id=?"
+                " GROUP BY candidate_present, eligibility_status, eligibility_reason"
+                " ORDER BY candidate_present DESC, eligibility_status, eligibility_reason",
+                [run["id"]],
+            ),
+        }
+        if run.get("candidate_count") is not None
+        else {}
+    )
     return {
+        **study,
         "run_id": int(run["id"]),
         "trigger_type": run.get("trigger_type"),
         "is_synthetic": bool(run.get("is_synthetic")),
@@ -505,7 +594,13 @@ def _update_latest_pointer(
     """Advance ``latest_valid.json`` — only ever called for a validated run."""
     pointer = cfg.daily_snapshot_dir / "latest_valid.json"
     pointer.parent.mkdir(parents=True, exist_ok=True)
+    study_counts = (
+        {"qualified_advertisements": run["active_count"], "raw_candidates": run["candidate_count"]}
+        if run.get("candidate_count") is not None
+        else {}
+    )
     payload = {
+        **study_counts,
         "run_id": int(run["id"]),
         "trigger_type": run.get("trigger_type"),
         "scheduled_for": _iso(run.get("scheduled_for")),

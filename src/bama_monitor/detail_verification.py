@@ -23,7 +23,7 @@ from dataclasses import field as dataclass_field
 from typing import Any
 
 from .config import MonitorConfig
-from .models import DetailVerdict, RunContext
+from .models import DetailResult, DetailVerdict, RunContext
 
 #: Interpretation attached to each verdict, stored with the evidence so a reader
 #: of the database does not have to reconstruct the reasoning.
@@ -76,32 +76,41 @@ async def verify_missing(
     outcomes: list[VerificationOutcome] = []
     for advertisement_id, platform_ad_id, url in targets:
         result = await detail_scraper.scrape(url)
-        verdict = result.verdict
-        evidence = {
-            "verdict": str(verdict),
-            "http_status": result.http_status,
-            "interpretation": VERDICT_INTERPRETATION.get(verdict, ""),
-            "checked_at": context.started_at.isoformat(),
-            "run_id": context.run_id,
-            "error": result.error,
-            # Explicit so no consumer can mistake this for a sale confirmation.
-            "is_sale_confirmation": False,
-        }
-        outcomes.append(
-            VerificationOutcome(
-                platform_ad_id=platform_ad_id,
-                advertisement_id=advertisement_id,
-                url=url,
-                verdict=verdict,
-                http_status=result.http_status,
-                evidence=evidence,
-                fields=dict(result.fields or {}),
-            )
-        )
-        if verdict is DetailVerdict.BLOCKED:
-            evidence["stopped_early"] = True
+        outcome = verification_from_result(result, advertisement_id, platform_ad_id, url, context)
+        outcomes.append(outcome)
+        if outcome.verdict is DetailVerdict.BLOCKED:
             break
     return outcomes
+
+
+def verification_from_result(
+    result: DetailResult,
+    advertisement_id: int,
+    platform_ad_id: str,
+    url: str,
+    context: RunContext,
+) -> VerificationOutcome:
+    verdict = result.verdict
+    evidence = {
+        "verdict": str(verdict),
+        "http_status": result.http_status,
+        "interpretation": VERDICT_INTERPRETATION.get(verdict, ""),
+        "checked_at": context.started_at.isoformat(),
+        "run_id": context.run_id,
+        "error": result.error,
+        "is_sale_confirmation": False,
+    }
+    if verdict is DetailVerdict.BLOCKED:
+        evidence["stopped_early"] = True
+    return VerificationOutcome(
+        platform_ad_id=platform_ad_id,
+        advertisement_id=advertisement_id,
+        url=url,
+        verdict=verdict,
+        http_status=result.http_status,
+        evidence=evidence,
+        fields=dict(result.fields or {}),
+    )
 
 
 def select_verification_targets(

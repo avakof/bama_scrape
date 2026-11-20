@@ -13,10 +13,12 @@ diagnosable trail.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import random
 import socket
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -28,10 +30,15 @@ from bama_scraper.logging_config import get_logger
 from .alerts import AlertManager
 from .config import MONITOR_VERSION, MonitorConfig
 from .db import Database, connect, parse_ts, utcnow
-from .detail_verification import select_verification_targets, verify_missing
+from .detail_verification import (
+    select_verification_targets,
+    verification_from_result,
+    verify_missing,
+)
 from .inventory_comparison import (
     ComparisonResult,
     InventoryComparator,
+    StudyObservation,
     finalize_run,
     skipped_run,
 )
@@ -44,6 +51,7 @@ from .models import (
     AlertSeverity,
     DetailAvailability,
     DetailCheckOutcome,
+    DetailResult,
     DetailVerdict,
     DiscoveryResult,
     EventType,
@@ -54,13 +62,18 @@ from .models import (
 from .publication import classify_published_source, to_datetime, truncation_status
 from .repository import Repository
 from .repost_detection import VehicleProfile, find_reposts, fingerprint, vehicle_entity_id
-from .run_health import HealthReport, anomaly_alerts
+from .run_health import HealthCheck, HealthReport, anomaly_alerts
 from .sale_scoring import ScoringInputs, score_sale
 from .scheduler import next_scheduled_slot
 from .search_filter import assert_bounds_parsed, classify_absence, parse_search_filter
 from .state_machine import AdState, mark_reposted, promote_to_likely_sold
 
 log = get_logger("bama_monitor.runner")
+
+NATIONWIDE_PROFILE = "nationwide_passenger_v1"
+#: The legacy detail alert uses the same failure ratio. In the study a
+#: systemic detail failure also prevents longitudinal decisions.
+DETAIL_FAILURE_LIMIT = 0.30
 
 
 @dataclass
@@ -87,6 +100,7 @@ class RunOutcome:
     #: completed + gone + permanent failure. Must equal the discovered count.
     detail_accounted: int = 0
     detail_coverage_rate: float | None = None
+    eligibility_counts: dict[str, int] | None = None
     skipped: bool = False
     error: str | None = None
     notes: list[str] = field(default_factory=list)
@@ -102,7 +116,13 @@ class RunOutcome:
                 "reason": self.comparison.reason if self.comparison else None,
                 **(self.comparison.counters() if self.comparison else {}),
             },
-            "discovered_count": self.discovery.discovered_count if self.discovery else 0,
+            "discovered_count": (
+                len(self.comparison.seen_ids)
+                if self.eligibility_counts is not None and self.comparison
+                else self.discovery.discovered_count
+                if self.discovery
+                else 0
+            ),
             "termination_reason": self.discovery.termination_reason if self.discovery else None,
             "detail_success": self.detail_success,
             "detail_failure": self.detail_failure,
@@ -110,6 +130,14 @@ class RunOutcome:
             "detail_permanent_failure": self.detail_permanent_failure,
             "detail_accounted": self.detail_accounted,
             "detail_coverage_rate": self.detail_coverage_rate,
+            **(
+                {
+                    "eligibility_counts": self.eligibility_counts,
+                    "candidate_count": sum(self.eligibility_counts.values()),
+                }
+                if self.eligibility_counts is not None
+                else {}
+            ),
             "missing_verifications": self.verifications,
             "filter_exits": self.filter_exits,
             "unexplained_absences": self.unexplained_absences,
@@ -139,6 +167,8 @@ class DailyRunner:
         self.alerts = AlertManager(self.repo, cfg.alerts)
         self._discovery_scraper = discovery_scraper
         self._detail_scraper_factory = detail_scraper_factory
+        self.study_profile = getattr(cfg, "study_profile", "legacy")
+        self.nationwide = self.study_profile == NATIONWIDE_PROFILE
         # Parsed once: the bounds an absent-but-live listing is re-checked against.
         self.search_filter = parse_search_filter(cfg.search_url)
         for warning in assert_bounds_parsed(cfg.search_url, self.search_filter):
@@ -180,6 +210,7 @@ class DailyRunner:
                     scheduler_instance_id=scheduler_instance_id,
                 )
         except LockUnavailable as exc:
+            self._assert_study_database()
             run_id = skipped_run(
                 self.db,
                 search_url=self.cfg.search_url,
@@ -200,6 +231,18 @@ class DailyRunner:
 
     # -- internals ---------------------------------------------------------
 
+    def _assert_study_database(self) -> None:
+        # Advertisement state is mutable and keyed by platform ID. A separate
+        # database keeps overlapping listing IDs from changing the legacy series.
+        if self.db.scalar(
+            "SELECT 1 FROM monitoring_runs WHERE study_profile <> ?"
+            " AND (study_profile=? OR ?=?) LIMIT 1",
+            [self.study_profile, NATIONWIDE_PROFILE, self.study_profile, NATIONWIDE_PROFILE],
+        ):
+            raise ValueError(
+                "The nationwide study and legacy monitoring require separate databases"
+            )
+
     async def _run(
         self,
         slot: datetime | None,
@@ -209,6 +252,7 @@ class DailyRunner:
         production_schedule_name: str | None = None,
         scheduler_instance_id: str | None = None,
     ) -> RunOutcome:
+        self._assert_study_database()
         previous = self.repo.last_valid_run(self.cfg.configuration_hash())
         paris = ZoneInfo(self.cfg.timezone)
         run_id, created = self.repo.create_or_get_run(
@@ -225,6 +269,7 @@ class DailyRunner:
             host_name=socket.gethostname(),
             process_id=os.getpid(),
             scheduler_instance_id=scheduler_instance_id,
+            study_profile=self.study_profile,
             scheduled_date_paris=(slot.astimezone(paris).date().isoformat() if slot else None),
             scheduled_hour_paris=(slot.astimezone(paris).strftime("%H-%M") if slot else None),
         )
@@ -250,6 +295,10 @@ class DailyRunner:
             configuration_hash=self.cfg.configuration_hash(),
             previous_valid_run_id=int(previous["id"]) if previous else None,
         )
+        if self.nationwide and not created:
+            stored = self.repo.get_run(run_id)
+            if stored and stored.get("finished_at"):
+                return self._replay_study(context, stored)
         outcome = RunOutcome(run_id=run_id, status=RunHealth.RUNNING)
         if not created:
             outcome.notes.append(
@@ -290,6 +339,8 @@ class DailyRunner:
         outcome.discovery = discovery
         self.repo.update_run(run_id, discovery_finished_at=utcnow())
         comparator = InventoryComparator(self.db, self.cfg)
+        if self.nationwide:
+            return await self._run_study(context, discovery, comparator, outcome)
 
         # --- persist (evidence first) -------------------------------------
         persist = comparator.persist_inventory(discovery, context)
@@ -304,28 +355,7 @@ class DailyRunner:
         # --- health -------------------------------------------------------
         health = comparator.validate(discovery, context, persisted=persist.persisted)
         outcome.health = health
-        for payload in anomaly_alerts(health, discovery):
-            self.alerts.raise_alert(
-                payload["alert_type"],
-                payload["message"],
-                severity=payload["severity"],
-                run_id=run_id,
-                metadata=payload["metadata"],
-            )
-        if discovery.blocked:
-            self.alerts.raise_alert(
-                "access_blocked",
-                "Bama returned a blocking response; run will not drive status changes",
-                severity=AlertSeverity.CRITICAL,
-                run_id=run_id,
-            )
-        if discovery.discovered_count == 0:
-            self.alerts.raise_alert(
-                "no_advertisements_found",
-                "discovery returned zero advertisements",
-                severity=AlertSeverity.CRITICAL,
-                run_id=run_id,
-            )
+        self._health_alerts(context.run_id, health, discovery)
 
         # --- comparison (gated on health) ---------------------------------
         comparison = comparator.compare(discovery, context, health, persist)
@@ -356,6 +386,423 @@ class DailyRunner:
             reposted_count=outcome.reposts,
         )
         return outcome
+
+    def _health_alerts(self, run_id: int, health: HealthReport, discovery: DiscoveryResult) -> None:
+        for payload in anomaly_alerts(health, discovery):
+            self.alerts.raise_alert(
+                payload["alert_type"],
+                payload["message"],
+                severity=payload["severity"],
+                run_id=run_id,
+                metadata=payload["metadata"],
+            )
+        if discovery.blocked:
+            self.alerts.raise_alert(
+                "access_blocked",
+                "Bama returned a blocking response; run will not drive status changes",
+                severity=AlertSeverity.CRITICAL,
+                run_id=run_id,
+            )
+        if discovery.discovered_count == 0:
+            self.alerts.raise_alert(
+                "no_advertisements_found",
+                "discovery returned zero advertisements",
+                severity=AlertSeverity.CRITICAL,
+                run_id=run_id,
+            )
+
+    async def _run_study(
+        self,
+        context: RunContext,
+        discovery: DiscoveryResult,
+        comparator: InventoryComparator,
+        outcome: RunOutcome,
+    ) -> RunOutcome:
+        from .eligibility import assess_card
+
+        cards, duplicates = comparator.unique_cards(discovery)
+        discoveries = replace(discovery, cards=list(cards.values()))
+        candidates: list[StudyObservation] = []
+        for card in cards.values():
+            assessment = assess_card(card)
+            candidates.append(
+                StudyObservation(
+                    card.platform_ad_id,
+                    card.canonical_url,
+                    card,
+                    assessment.status,
+                    assessment.reason,
+                    "card",
+                    assessment.price_toman,
+                )
+            )
+
+        health = comparator.validate(discoveries, context, persisted=True, study_misses=set())
+        absent: list[StudyObservation] = []
+        checks: list[tuple[StudyObservation, DetailResult, datetime, int]] = []
+        if health.valid:
+            population = self.repo.comparison_population(context.configuration_hash, study=True)
+            missing = [row for row in population if row["platform_ad_id"] not in cards]
+            absent = [
+                StudyObservation(str(row["platform_ad_id"]), str(row["canonical_url"]))
+                for row in missing
+            ]
+            checks = await self._check_study_details(context, candidates, absent, missing)
+            verified_missing = {obs.platform_ad_id for obs in absent if obs.status == "missing"}
+            blocked = any(result.verdict is DetailVerdict.BLOCKED for _, result, _, _ in checks)
+            discoveries = replace(discoveries, blocked=blocked)
+            health = comparator.validate(
+                discoveries, context, persisted=True, study_misses=verified_missing
+            )
+
+        self._study_health_checks(health, candidates, checks)
+        outcome.health = health
+        outcome.status = health.status
+
+        # Everything that advances the longitudinal state commits together.
+        # A restarted process can recollect before this commit, and a completed
+        # slot is replayed from its immutable rows without fetching again.
+        with self.db.transaction():
+            comparison = comparator.compare_study(context, health, candidates + absent)
+            outcome.comparison = comparison
+            self.repo.update_run(
+                context.run_id,
+                candidate_count=len(candidates),
+                discovered_count=len(comparison.seen_ids),
+                duplicate_count=duplicates + discovery.duplicate_count,
+                termination_reason=discovery.termination_reason,
+                detail_finished_at=utcnow() if checks else None,
+            )
+            for observation, result, started, elapsed_ms in checks:
+                self._persist_study_detail(
+                    context, outcome, observation, result, started, elapsed_ms
+                )
+            outcome.eligibility_counts = self.repo.study_observation_counts(context.run_id)
+            self._record_study_coverage(context, outcome, len(candidates))
+            if comparison.applied:
+                self._repost_phase(context, comparison, outcome)
+                self._scoring_phase(context, outcome)
+            self._freeze_study_state(context.run_id)
+            outcome.filter_exits = len(
+                self.repo.events_for_run(context.run_id, EventType.FILTER_EXIT)
+            )
+            outcome.unexplained_absences = sum(obs.status == "unknown" for obs in absent)
+            finalize_run(
+                self.db,
+                context,
+                health,
+                comparison,
+                detail_success=outcome.detail_success,
+                detail_failure=outcome.detail_failure,
+            )
+            self.repo.update_run(
+                context.run_id,
+                likely_sold_count=outcome.promoted_sold,
+                reposted_count=outcome.reposts,
+            )
+        self._health_alerts(context.run_id, health, discoveries)
+        if comparison.applied:
+            self._removal_rate_alert(context, comparison)
+        return outcome
+
+    @staticmethod
+    def _study_health_checks(
+        health: HealthReport,
+        candidates: list[StudyObservation],
+        checks: list[tuple[StudyObservation, DetailResult, datetime, int]],
+    ) -> None:
+        if not health.valid:
+            return
+        unknown = sum(obs.status == "unknown" for obs in candidates)
+        qualified = sum(obs.status == "qualified" for obs in candidates)
+        # A live, parsed page can legitimately have an unsupported offer.
+        # Only failures to obtain/parse usable page evidence count here.
+        failures = sum(
+            obs.source == "detail" and obs.status == "unknown" for obs, _, _, _ in checks
+        )
+        failure_ratio = failures / len(checks) if checks else 0.0
+        health.checks.extend(
+            [
+                HealthCheck(
+                    "candidate_eligibility_complete",
+                    unknown == 0,
+                    f"{unknown} of {len(candidates)} candidate(s) have unresolved eligibility",
+                    blocking=False,
+                    observed=unknown,
+                ),
+                HealthCheck(
+                    "qualified_cohort_nonempty",
+                    qualified > 0,
+                    f"{qualified} of {len(candidates)} candidate(s) qualified",
+                    observed=qualified,
+                    threshold=1,
+                ),
+                HealthCheck(
+                    "detail_infrastructure_available",
+                    failure_ratio <= DETAIL_FAILURE_LIMIT,
+                    f"{failures}/{len(checks)} detail request(s) failed or could not be parsed",
+                    observed=round(failure_ratio, 4),
+                    threshold=DETAIL_FAILURE_LIMIT,
+                ),
+            ]
+        )
+        if health.failed_blocking:
+            health.status = RunHealth.INVALID
+
+    async def _check_study_details(
+        self,
+        context: RunContext,
+        candidates: list[StudyObservation],
+        absent: list[StudyObservation],
+        missing: list[dict[str, Any]],
+    ) -> list[tuple[StudyObservation, DetailResult, datetime, int]]:
+        from .eligibility import assess_detail
+
+        policy = self.cfg.detail
+        cap = policy.max_details_per_run
+        by_id = {obs.platform_ad_id: obs for obs in absent}
+        verification_targets = [
+            by_id[key] for _, key, _ in select_verification_targets(missing, self.cfg)
+        ]
+        if policy.check_every_advertisement_daily:
+            targets = candidates + verification_targets
+        else:
+            unresolved = [obs for obs in candidates if obs.status == "unknown"]
+            targets = (verification_targets + unresolved)[:cap]
+        if not targets:
+            return []
+
+        checks = []
+        self.repo.update_run(context.run_id, detail_started_at=utcnow())
+        factory = self._detail_scraper_factory or self._default_detail_factory
+        async with factory() as scraper:
+            for observation in targets:
+                started = utcnow()
+                try:
+                    result = await scraper.scrape(observation.url)
+                except Exception as exc:  # noqa: BLE001 - keep the candidate evidence
+                    result = DetailResult(
+                        observation.platform_ad_id,
+                        observation.url,
+                        ok=False,
+                        verdict=DetailVerdict.TEMPORARY_ERROR,
+                        error=repr(exc),
+                    )
+                elapsed_ms = int((utcnow() - started).total_seconds() * 1000)
+                checks.append((observation, result, started, elapsed_ms))
+                is_candidate = observation.card is not None
+                observation.source = "detail"
+                observation.price_toman = None
+                if result.verdict in STRONG_REMOVAL_VERDICTS or (
+                    result.verdict is DetailVerdict.EXPLICITLY_UNAVAILABLE
+                    and result.http_status == 200
+                ):
+                    observation.status = "gone" if is_candidate else "missing"
+                    observation.reason = str(result.verdict)
+                elif result.ok and result.verdict is DetailVerdict.STILL_ACTIVE:
+                    assessment = assess_detail(result.fields)
+                    observation.status = assessment.status
+                    observation.reason = assessment.reason
+                    observation.price_toman = assessment.price_toman
+                    observation.source = "live_detail"
+                    if assessment.status == "unknown" and (result.error or not result.fields):
+                        observation.source = "detail"
+                    if not is_candidate and assessment.status == "qualified":
+                        observation.status = "unknown"
+                        observation.reason = "live_qualifying_detail_absent_from_search"
+                else:
+                    observation.status = "unknown"
+                    observation.reason = str(result.verdict)
+                if result.verdict is DetailVerdict.BLOCKED:
+                    break
+        return checks
+
+    def _persist_study_detail(
+        self,
+        context: RunContext,
+        outcome: RunOutcome,
+        observation: StudyObservation,
+        result: DetailResult,
+        started: datetime,
+        elapsed_ms: int,
+    ) -> None:
+        row = self.repo.get_advertisement(observation.platform_ad_id)
+        assert row is not None
+        advertisement_id = int(row["id"])
+        if observation.card is None:
+            verification = verification_from_result(
+                result, advertisement_id, observation.platform_ad_id, observation.url, context
+            )
+            self.repo.record_verification(
+                advertisement_id=advertisement_id,
+                run_id=context.run_id,
+                url=observation.url,
+                verdict=str(result.verdict),
+                http_status=result.http_status,
+                checked_at=started,
+                evidence={
+                    **verification.evidence,
+                    "eligibility_status": observation.status,
+                    "eligibility_reason": observation.reason,
+                    "assessed_price_toman": observation.price_toman,
+                },
+            )
+            if outcome.status is RunHealth.VALID:
+                self.db.execute(
+                    "UPDATE advertisements SET last_detail_verdict=?, last_detail_checked_at=?"
+                    " WHERE id=?",
+                    [str(result.verdict), started, advertisement_id],
+                )
+                if observation.source == "live_detail":
+                    self.repo.record_event(
+                        advertisement_id=advertisement_id,
+                        run_id=context.run_id,
+                        event_type=EventType.DETAIL_STILL_ACTIVE,
+                        previous_status=None,
+                        new_status=None,
+                        event_at=context.started_at,
+                        evidence=verification.evidence,
+                    )
+            outcome.verifications += 1
+            return
+
+        snapshot_id = None
+        changed = False
+        if result.ok:
+            kind = DetailCheckOutcome.COMPLETED
+            if outcome.status is RunHealth.VALID and observation.status == "qualified":
+                price = observation.price_toman
+                # The adapter's content hash is not defined over our strict
+                # normalization. Include the assessed ask in the dedup key.
+                source_hash = result.content_hash or json.dumps(
+                    result.fields, sort_keys=True, default=str
+                )
+                digest = hashlib.sha256(f"{source_hash}:{price}".encode()).hexdigest()
+                result = replace(
+                    result, content_hash=digest, fields={**result.fields, "price_toman": price}
+                )
+                kind, snapshot_id, changed = self._apply_detail_result(
+                    advertisement_id, context, result, "study"
+                )
+                self.db.execute(
+                    "UPDATE advertisements SET latest_snapshot_id=? WHERE id=?",
+                    [snapshot_id, advertisement_id],
+                )
+        elif result.verdict in STRONG_REMOVAL_VERDICTS:
+            kind = DetailCheckOutcome.GONE
+        elif result.verdict in (DetailVerdict.TEMPORARY_ERROR, DetailVerdict.BLOCKED):
+            kind = DetailCheckOutcome.RETRYABLE_FAILURE
+        else:
+            kind = DetailCheckOutcome.PERMANENT_FAILURE
+        self._record_detail_check(
+            advertisement_id,
+            context,
+            outcome,
+            result,
+            started,
+            elapsed_ms,
+            kind,
+            snapshot_id,
+            changed,
+        )
+
+    def _record_study_coverage(
+        self, context: RunContext, outcome: RunOutcome, candidates: int
+    ) -> None:
+        # A successful parse can still leave an ambiguous offer. Count only
+        # candidates with a definitive cohort decision or a definitive gone page.
+        counts = outcome.eligibility_counts or {}
+        accounted = sum(
+            counts.get(status, 0) for status in ("qualified", "price_exit", "out_of_scope", "gone")
+        )
+        outcome.detail_accounted = accounted
+        outcome.detail_coverage_rate = round(accounted / candidates, 6) if candidates else None
+        self.repo.update_run(
+            context.run_id,
+            detail_accounted_count=accounted,
+            detail_gone_count=outcome.detail_gone,
+            detail_permanent_failure_count=outcome.detail_permanent_failure,
+            detail_retryable_failure_count=outcome.detail_failure,
+            detail_coverage_rate=outcome.detail_coverage_rate,
+        )
+
+    def _freeze_study_state(self, run_id: int) -> None:
+        rows = self.db.fetchall(
+            "SELECT o.id AS observation_id, a.current_status, a.detail_availability,"
+            " a.sale_label, a.sale_confidence AS sale_evidence_score, a.vehicle_entity_id,"
+            " a.repost_parent_ad_id, a.first_seen_at, a.last_seen_at, a.first_missing_at,"
+            " a.consecutive_misses, a.published_at, a.published_at_source, a.left_truncated,"
+            " a.eligible_for_duration_ranking, a.filter_exit_reason"
+            " FROM daily_ad_observations o JOIN advertisements a ON a.id=o.advertisement_id"
+            " WHERE o.run_id=?",
+            [run_id],
+        )
+        for row in rows:
+            observation_id = row.pop("observation_id")
+            self.db.execute(
+                "UPDATE daily_ad_observations SET study_state_json=? WHERE id=?",
+                [
+                    self.db.json_dump(
+                        {
+                            key: value.isoformat() if isinstance(value, datetime) else value
+                            for key, value in row.items()
+                        }
+                    ),
+                    observation_id,
+                ],
+            )
+
+    def _replay_study(self, context: RunContext, stored: dict[str, Any]) -> RunOutcome:
+        rows = self.db.fetchall(
+            "SELECT a.platform_ad_id, o.was_seen, o.candidate_present, o.eligibility_status"
+            " FROM daily_ad_observations o"
+            " JOIN advertisements a ON a.id=o.advertisement_id WHERE o.run_id=? ORDER BY o.id",
+            [context.run_id],
+        )
+
+        def ids_for(event_type: EventType) -> list[str]:
+            return [
+                str(row["platform_ad_id"])
+                for row in self.repo.events_for_run(context.run_id, event_type)
+            ]
+
+        applied = bool(stored.get("comparison_applied"))
+        missing = [
+            str(row["platform_ad_id"])
+            for row in rows
+            if applied and row["eligibility_status"] == "missing"
+        ]
+        return RunOutcome(
+            run_id=context.run_id,
+            status=RunHealth(str(stored["status"])),
+            comparison=ComparisonResult(
+                run_id=context.run_id,
+                previous_run_id=stored["previous_valid_run_id"],
+                applied=applied,
+                reason="returning completed scheduled run",
+                new_ids=ids_for(EventType.DISCOVERED),
+                seen_ids=[str(row["platform_ad_id"]) for row in rows if row["was_seen"]],
+                missing_ids=missing,
+                newly_missing_ids=ids_for(EventType.MISSING_FIRST_TIME),
+                likely_removed_ids=ids_for(EventType.REMOVAL_CONFIRMED),
+                reappeared_ids=ids_for(EventType.REAPPEARED),
+                reposted_ids=ids_for(EventType.POSSIBLE_REPOST),
+            ),
+            eligibility_counts=self.repo.study_observation_counts(context.run_id),
+            filter_exits=len(ids_for(EventType.FILTER_EXIT)),
+            unexplained_absences=sum(
+                not row["candidate_present"] and row["eligibility_status"] == "unknown"
+                for row in rows
+            ),
+            reposts=int(stored["reposted_count"] or 0),
+            promoted_sold=int(stored["likely_sold_count"] or 0),
+            detail_success=int(stored["detail_success_count"] or 0),
+            detail_failure=int(stored["detail_failure_count"] or 0),
+            detail_gone=int(stored["detail_gone_count"] or 0),
+            detail_permanent_failure=int(stored["detail_permanent_failure_count"] or 0),
+            detail_accounted=int(stored["detail_accounted_count"] or 0),
+            detail_coverage_rate=stored["detail_coverage_rate"],
+        )
 
     def _default_discovery(self, evidence_dir: Path) -> Any:
         from .scrapers import BamaDiscoveryScraper
@@ -478,6 +925,9 @@ class DailyRunner:
         references the existing immutable snapshot through ``snapshot_id`` rather
         than writing the payload again. Checking and storing are separate concepts.
         """
+        if self.nationwide:
+            outcome.notes.append("study detail checks are recorded only during the daily run")
+            return
         full_census = self.cfg.detail.check_every_advertisement_daily
         targets = (
             self._all_inventory_targets(context)
@@ -508,44 +958,17 @@ class DailyRunner:
                 outcome_kind, snapshot_id, changed = self._apply_detail_result(
                     advertisement_id, context, result, reason
                 )
-                self.repo.record_detail_check(
-                    {
-                        "run_id": context.run_id,
-                        "advertisement_id": advertisement_id,
-                        "checked_at": started,
-                        "detail_http_status": result.http_status,
-                        "detail_availability": str(
-                            AVAILABILITY_BY_VERDICT.get(
-                                str(result.verdict), DetailAvailability.UNKNOWN
-                            )
-                        ),
-                        # "parse_failed" is a claim about our parser, so it is
-                        # reserved for the case where parsing was actually tried.
-                        # A 404, a block or a timeout never reached the parser.
-                        "parser_status": "ok"
-                        if result.ok
-                        else "parse_failed"
-                        if result.verdict is DetailVerdict.PARSE_ERROR
-                        else "not_attempted",
-                        "content_hash": result.content_hash,
-                        "snapshot_id": snapshot_id,
-                        "content_changed": changed,
-                        "attempt_count": 1,
-                        "duration_ms": elapsed_ms,
-                        "outcome": str(outcome_kind),
-                        "error_type": None if result.ok else str(result.verdict),
-                        "error_message": result.error,
-                    }
+                self._record_detail_check(
+                    advertisement_id,
+                    context,
+                    outcome,
+                    result,
+                    started,
+                    elapsed_ms,
+                    outcome_kind,
+                    snapshot_id,
+                    changed,
                 )
-
-                if outcome_kind is DetailCheckOutcome.COMPLETED:
-                    outcome.detail_success += 1
-                elif outcome_kind is DetailCheckOutcome.GONE:
-                    outcome.detail_gone += 1
-                elif outcome_kind is DetailCheckOutcome.PERMANENT_FAILURE:
-                    outcome.detail_permanent_failure += 1
-                else:
-                    outcome.detail_failure += 1
 
                 if result.verdict is DetailVerdict.BLOCKED:
                     blocked = True
@@ -570,13 +993,62 @@ class DailyRunner:
             + outcome.detail_gone
             + outcome.detail_permanent_failure
         )
-        if attempted and outcome.detail_failure / attempted > 0.30:
+        if attempted and outcome.detail_failure / attempted > DETAIL_FAILURE_LIMIT:
             self.alerts.raise_alert(
                 "detail_failure_rate_exceeded",
                 f"detail failure rate {outcome.detail_failure}/{attempted}",
                 severity=AlertSeverity.WARNING,
                 run_id=context.run_id,
             )
+
+    def _record_detail_check(
+        self,
+        advertisement_id: int,
+        context: RunContext,
+        outcome: RunOutcome,
+        result: DetailResult,
+        started: datetime,
+        elapsed_ms: int,
+        outcome_kind: DetailCheckOutcome,
+        snapshot_id: int | None,
+        changed: bool,
+    ) -> None:
+        self.repo.record_detail_check(
+            {
+                "run_id": context.run_id,
+                "advertisement_id": advertisement_id,
+                "checked_at": started,
+                "detail_http_status": result.http_status,
+                "detail_availability": str(
+                    AVAILABILITY_BY_VERDICT.get(str(result.verdict), DetailAvailability.UNKNOWN)
+                ),
+                # "parse_failed" is a claim about our parser, so it is
+                # reserved for the case where parsing was actually tried.
+                # A 404, a block or a timeout never reached the parser.
+                "parser_status": "ok"
+                if result.ok
+                else "parse_failed"
+                if result.verdict is DetailVerdict.PARSE_ERROR
+                else "not_attempted",
+                "content_hash": result.content_hash,
+                "snapshot_id": snapshot_id,
+                "content_changed": changed,
+                "attempt_count": 1,
+                "duration_ms": elapsed_ms,
+                "outcome": str(outcome_kind),
+                "error_type": None if result.ok else str(result.verdict),
+                "error_message": result.error,
+            }
+        )
+
+        if outcome_kind is DetailCheckOutcome.COMPLETED:
+            outcome.detail_success += 1
+        elif outcome_kind is DetailCheckOutcome.GONE:
+            outcome.detail_gone += 1
+        elif outcome_kind is DetailCheckOutcome.PERMANENT_FAILURE:
+            outcome.detail_permanent_failure += 1
+        else:
+            outcome.detail_failure += 1
 
     def _all_inventory_targets(self, context: RunContext) -> list[tuple[int, str, str, str]]:
         """Every advertisement observed as present in this run.
@@ -778,7 +1250,8 @@ class DailyRunner:
                     "new_content_hash": result.content_hash,
                 },
             )
-            self._detail_price_change(advertisement_id, context, latest, fields)
+            if not self.nationwide:
+                self._detail_price_change(advertisement_id, context, latest, fields)
         return snapshot_id
 
     def _detail_price_change(
@@ -955,8 +1428,20 @@ class DailyRunner:
             " s.interior_color, s.description, s.media_json"
             " FROM advertisements a LEFT JOIN advertisement_snapshots s"
             " ON s.id = a.latest_snapshot_id"
-            " WHERE a.current_status IN (?,?) AND (a.first_missing_at IS NULL OR a.first_missing_at >= ?)",
-            [str(AdStatus.LIKELY_REMOVED), str(AdStatus.MISSING_ONCE), cutoff],
+            " WHERE a.current_status IN (?,?) AND (a.first_missing_at IS NULL OR a.first_missing_at >= ?)"
+            + (
+                " AND a.search_configuration_hash=? AND a.id IN ("
+                "SELECT advertisement_id FROM daily_ad_observations"
+                " WHERE run_id=? AND eligibility_status='missing')"
+                if self.nationwide
+                else ""
+            ),
+            [
+                str(AdStatus.LIKELY_REMOVED),
+                str(AdStatus.MISSING_ONCE),
+                cutoff,
+                *([context.configuration_hash, context.run_id] if self.nationwide else []),
+            ],
         )
         children = self.db.fetchall(
             "SELECT a.*, s.brand, s.model, s.trim, s.year, s.mileage_normalized,"
@@ -1036,12 +1521,20 @@ class DailyRunner:
         or fall as evidence accumulates without rewriting the observed history.
         """
         rows = self.db.fetchall(
-            "SELECT * FROM advertisements WHERE current_status IN (?,?,?,?)",
+            "SELECT * FROM advertisements WHERE current_status IN (?,?,?,?)"
+            + (
+                " AND search_configuration_hash=? AND id IN ("
+                "SELECT advertisement_id FROM daily_ad_observations"
+                " WHERE run_id=? AND eligibility_status='missing')"
+                if self.nationwide
+                else ""
+            ),
             [
                 str(AdStatus.MISSING_ONCE),
                 str(AdStatus.LIKELY_REMOVED),
                 str(AdStatus.LIKELY_SOLD),
                 str(AdStatus.REPOSTED),
+                *([context.configuration_hash, context.run_id] if self.nationwide else []),
             ],
         )
         for row in rows:
@@ -1053,7 +1546,7 @@ class DailyRunner:
                 removal_confirmation_misses=self.cfg.removal_confirmation_misses,
                 detail_verdict=DetailVerdict(verdict_value) if verdict_value else None,
                 persistent_unavailable_checks=self.repo.consecutive_unavailable_checks(
-                    advertisement_id
+                    advertisement_id, study_run_id=context.run_id if self.nationwide else None
                 ),
                 had_price_reduction=self.repo.recent_price_reduction(advertisement_id),
                 first_seen_at=parse_ts(row.get("first_seen_at")),

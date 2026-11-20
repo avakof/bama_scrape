@@ -83,7 +83,7 @@ def recent_valid_counts(db: Database, config_hash: str, limit: int) -> list[int]
     makes older counts incomparable, and using them would produce a false anomaly.
     """
     rows = db.fetchall(
-        "SELECT discovered_count FROM monitoring_runs"
+        "SELECT COALESCE(candidate_count, discovered_count) AS discovered_count FROM monitoring_runs"
         " WHERE status = ? AND configuration_hash = ? AND discovered_count IS NOT NULL"
         " ORDER BY scheduled_for DESC LIMIT ?",
         [str(RunHealth.VALID), config_hash, limit],

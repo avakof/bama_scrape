@@ -27,9 +27,11 @@ from .db import Database, parse_ts, utcnow
 from .models import (
     AdStatus,
     ComparisonResult,
+    DetailAvailability,
     DiscoveredCard,
     DiscoveryResult,
     EventType,
+    FilterExitReason,
     RunContext,
     RunHealth,
     StatusTransition,
@@ -49,6 +51,19 @@ class PersistOutcome:
     price_changes: int
     persisted: bool
     error: str | None = None
+
+
+@dataclass
+class StudyObservation:
+    """Evidence for one candidate or previously qualified listing."""
+
+    platform_ad_id: str
+    url: str
+    card: DiscoveredCard | None = None
+    status: str = "unknown"
+    reason: str = "detail_not_checked"
+    source: str = "none"
+    price_toman: int | None = None
 
 
 class InventoryComparator:
@@ -73,20 +88,7 @@ class InventoryComparator:
         ad_ids: dict[str, int] = {}
         price_changes = 0
 
-        # Deduplicate: platform id first, then canonical URL as a fallback.
-        unique: dict[str, DiscoveredCard] = {}
-        by_url: dict[str, str] = {}
-        duplicates = 0
-        for card in result.cards:
-            key = card.platform_ad_id
-            if key in unique:
-                duplicates += 1
-                continue
-            if card.canonical_url in by_url:
-                duplicates += 1
-                continue
-            unique[key] = card
-            by_url[card.canonical_url] = key
+        unique, duplicates = self.unique_cards(result)
 
         try:
             for platform_ad_id, card in unique.items():
@@ -127,6 +129,25 @@ class InventoryComparator:
             termination_reason=result.termination_reason,
         )
         return PersistOutcome(seen_ids, new_ids, ad_ids, price_changes, persisted=True)
+
+    @staticmethod
+    def unique_cards(result: DiscoveryResult) -> tuple[dict[str, DiscoveredCard], int]:
+        # Deduplicate: platform id first, then canonical URL as a fallback.
+        unique: dict[str, DiscoveredCard] = {}
+        by_url: dict[str, str] = {}
+        duplicates = 0
+        for card in result.cards:
+            key = card.platform_ad_id
+            if key in unique:
+                duplicates += 1
+                continue
+            if card.canonical_url in by_url:
+                duplicates += 1
+                continue
+            unique[key] = card
+            by_url[card.canonical_url] = key
+
+        return unique, duplicates
 
     def _detect_card_price_change(
         self, advertisement_id: int, card: DiscoveredCard, context: RunContext
@@ -187,15 +208,26 @@ class InventoryComparator:
     # -- step 3: health ----------------------------------------------------
 
     def validate(
-        self, result: DiscoveryResult, context: RunContext, *, persisted: bool
+        self,
+        result: DiscoveryResult,
+        context: RunContext,
+        *,
+        persisted: bool,
+        study_misses: set[str] | None = None,
     ) -> HealthReport:
         """Evaluate whether this run may drive status transitions."""
         baseline = recent_valid_counts(
             self.db, context.configuration_hash, self.cfg.health.median_window_runs
         )
-        population = self.repo.comparison_population(context.configuration_hash)
-        seen = result.unique_ids()
-        expected_missing = sum(1 for row in population if str(row["platform_ad_id"]) not in seen)
+        study = study_misses is not None
+        population = self.repo.comparison_population(context.configuration_hash, study=study)
+        if study_misses is None:
+            seen = result.unique_ids()
+            expected_missing = sum(
+                1 for row in population if str(row["platform_ad_id"]) not in seen
+            )
+        else:
+            expected_missing = len(study_misses)
         return evaluate_run(
             result,
             self.cfg,
@@ -281,6 +313,179 @@ class InventoryComparator:
                 **counters,
             )
         return outcome
+
+    def compare_study(
+        self, context: RunContext, health: HealthReport, observations: list[StudyObservation]
+    ) -> ComparisonResult:
+        """Persist raw evidence and apply only qualified or verified observations.
+
+        The runner commits these rows alongside their detail evidence and the
+        final run status in a single transaction.
+        """
+        outcome = ComparisonResult(
+            run_id=context.run_id,
+            previous_run_id=context.previous_valid_run_id,
+            applied=health.valid,
+            reason=health.reason(),
+        )
+        for observation in observations:
+            key = observation.platform_ad_id
+            row = self.repo.get_advertisement(key)
+            qualified = health.valid and observation.status == "qualified"
+            if row is None:
+                ad_id = self.repo.upsert_advertisement(
+                    platform_ad_id=key,
+                    canonical_url=observation.url,
+                    current_status=AdStatus.UNKNOWN,
+                )
+                outcome.observed_new_ids.append(key)
+            else:
+                ad_id = int(row["id"])
+            self.repo.record_observation(
+                run_id=context.run_id,
+                advertisement_id=ad_id,
+                was_seen=qualified,
+                observed_at=context.started_at,
+                card=observation.card,
+                study_evidence={
+                    "candidate_present": observation.card is not None,
+                    "eligibility_status": observation.status,
+                    "eligibility_reason": observation.reason,
+                    "eligibility_source": observation.source,
+                    "assessed_price_toman": observation.price_toman,
+                    "eligible_price_toman": observation.price_toman if qualified else None,
+                    "card_price_normalized": observation.price_toman if qualified else None,
+                    "raw_card_price_normalized": (
+                        observation.card.card_price_normalized if observation.card else None
+                    ),
+                },
+            )
+
+            if qualified:
+                outcome.seen_ids.append(key)
+                self._apply_study_seen(observation, ad_id, context, outcome)
+            elif health.valid and row and row["total_seen_runs"]:
+                if row["search_configuration_hash"] != context.configuration_hash:
+                    continue
+                if observation.status == "missing":
+                    self._apply_missing(row, context, outcome)
+                elif observation.status in {"price_exit", "out_of_scope"}:
+                    self._apply_study_exit(observation, row, context)
+                elif row["current_status"] != AdStatus.ACTIVE_OUTSIDE_FILTER:
+                    self._apply_study_unresolved(observation, row, context)
+        self.repo.update_run(context.run_id, **outcome.counters())
+        return outcome
+
+    def _apply_study_seen(
+        self,
+        observation: StudyObservation,
+        ad_id: int,
+        context: RunContext,
+        outcome: ComparisonResult,
+    ) -> None:
+        # The raw card remains intact. Price history uses only verified asks
+        # from valid observations, including asks resolved from today's detail.
+        previous = self.repo.previous_eligible_observation(ad_id, context.run_id)
+        if previous and previous["eligible_price_toman"] != observation.price_toman:
+            old_price = int(previous["eligible_price_toman"])
+            new_price = observation.price_toman
+            assert new_price is not None
+            change_type = "price_increase" if new_price > old_price else "price_decrease"
+            self.repo.record_price_change(
+                advertisement_id=ad_id,
+                run_id=context.run_id,
+                change_type=change_type,
+                old_price=old_price,
+                new_price=new_price,
+                old_price_raw=previous["card_price_raw"],
+                new_price_raw=observation.card.card_price_raw if observation.card else None,
+                changed_at=context.started_at,
+            )
+            self.repo.record_event(
+                advertisement_id=ad_id,
+                run_id=context.run_id,
+                event_type=EventType.PRICE_CHANGED,
+                previous_status=None,
+                new_status=None,
+                event_at=context.started_at,
+                evidence={
+                    "change_type": change_type,
+                    "old_price": old_price,
+                    "new_price": new_price,
+                    "source": observation.source,
+                },
+            )
+        self._apply_seen(observation.platform_ad_id, ad_id, context, outcome)
+        self.db.execute(
+            "UPDATE advertisements SET search_configuration_hash=?,"
+            " first_run_id=COALESCE(first_run_id,?), first_missing_at=NULL,"
+            " confirmed_removed_at=NULL, suspected_sold_at=NULL,"
+            " filter_exit_reason=NULL, filter_exit_at=NULL, filter_exit_evidence_json=NULL,"
+            " sale_label='unknown', sale_confidence=0, detail_availability=? WHERE id=?",
+            [context.configuration_hash, context.run_id, str(DetailAvailability.AVAILABLE), ad_id],
+        )
+
+    def _apply_study_exit(
+        self, observation: StudyObservation, row: dict[str, Any], context: RunContext
+    ) -> None:
+        if row["current_status"] == AdStatus.ACTIVE_OUTSIDE_FILTER:
+            return
+        reason = (
+            str(FilterExitReason.PRICE_BELOW_FILTER)
+            if observation.status == "price_exit"
+            else "out_of_scope"
+        )
+        evidence = {
+            "reason": reason,
+            "eligibility_reason": observation.reason,
+            "assessed_price_toman": observation.price_toman,
+            "source": observation.source,
+            "status_changed": True,
+        }
+        self._set_study_nonmember(
+            row, context, AdStatus.ACTIVE_OUTSIDE_FILTER, DetailAvailability.OUTSIDE_FILTER
+        )
+        self.db.execute(
+            "UPDATE advertisements SET filter_exit_reason=?, filter_exit_at=?,"
+            " filter_exit_evidence_json=? WHERE id=?",
+            [reason, context.started_at, self.db.json_dump(evidence), row["id"]],
+        )
+        self.repo.record_event(
+            advertisement_id=int(row["id"]),
+            run_id=context.run_id,
+            event_type=EventType.FILTER_EXIT,
+            previous_status=AdStatus(str(row["current_status"])),
+            new_status=AdStatus.ACTIVE_OUTSIDE_FILTER,
+            event_at=context.started_at,
+            evidence=evidence,
+        )
+
+    def _apply_study_unresolved(
+        self, observation: StudyObservation, row: dict[str, Any], context: RunContext
+    ) -> None:
+        # An unresolved day breaks a sequence of verified misses, without
+        # evicting the listing from tomorrow's comparison population.
+        availability = (
+            DetailAvailability.AVAILABLE
+            if observation.source == "live_detail"
+            else DetailAvailability.UNKNOWN
+        )
+        self._set_study_nonmember(row, context, AdStatus.UNKNOWN, availability)
+
+    def _set_study_nonmember(
+        self,
+        row: dict[str, Any],
+        context: RunContext,
+        status: AdStatus,
+        availability: DetailAvailability,
+    ) -> None:
+        self.db.execute(
+            "UPDATE advertisements SET current_status=?, detail_availability=?,"
+            " consecutive_misses=0, first_missing_at=NULL, confirmed_removed_at=NULL,"
+            " suspected_sold_at=NULL, sale_label='unknown', sale_confidence=0, latest_snapshot_id=NULL,"
+            " last_checked_run_id=?, updated_at=? WHERE id=?",
+            [str(status), str(availability), context.run_id, utcnow(), row["id"]],
+        )
 
     def _replayed(
         self, context: RunContext, stored: dict[str, Any], persist: PersistOutcome
@@ -527,6 +732,7 @@ def skipped_run(
         trigger_type=trigger_type,
         is_synthetic=is_synthetic,
         production_schedule_name=production_schedule_name,
+        study_profile=getattr(cfg, "study_profile", "legacy"),
     )
     repo.update_run(
         run_id,
